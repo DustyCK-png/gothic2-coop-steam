@@ -1,0 +1,104 @@
+diff --git a/Plugin.cpp b/Plugin.cpp
+index b098afe..de3ef43 100644
+--- a/Plugin.cpp
++++ b/Plugin.cpp
+@@ -1,6 +1,10 @@
+ ﻿#include "resource.h"
+ 
+ namespace GOTHIC_ENGINE {
++    bool QaRole(const char* role) {
++        char value[32]={0};
++        return GetEnvironmentVariableA("G2_COOP_QA",value,sizeof(value)) && !strcmp(value,role);
++    }
+     void Game_Entry() {
+         GetCurrentDirectory(MAX_PATH, GothicExeFolderPath);
+ 
+@@ -138,10 +142,10 @@ namespace GOTHIC_ENGINE {
+ 
+         PluginState = "KeysPressedChecks";
+         if (!IsPlayerTalkingWithAnybody() && !WorldEditMode) {
+-            if (zinput->KeyToggled(StartServerKey) && !ServerThread && !ClientThread) {
++            if ((zinput->KeyToggled(StartServerKey) || QaRole("host")) && !ServerThread && !ClientThread) {
+                 wchar_t mappedPort[1234];
+                 std::wcsncpy(mappedPort, L"UDP", 1234);
+-                new MappedPort(ConnectionPort, mappedPort, mappedPort);
++                // Steam relay needs no router mapping. Do not mutate the player's router.
+ 
+                 Thread t;
+                 t.Init(&CoopServerThread);
+@@ -151,7 +155,7 @@ namespace GOTHIC_ENGINE {
+                 player->SetAdditionalVisuals(zSTRING("hum_body_Naked0"), MyBodyTextVarNr, DefaultBodyTexColorNr, zSTRING("HUM_HEAD_PONY"), MyHeadVarNr, 0, -1);
+             }
+ 
+-            if (zinput->KeyToggled(StartConnectionKey) && !ServerThread) {
++            if ((zinput->KeyToggled(StartConnectionKey) || (QaRole("client") && !ClientThread)) && !ServerThread) {
+                 if (!ClientThread) {
+                     addSyncedNpc("HOST");
+ 
+@@ -232,6 +236,20 @@ namespace GOTHIC_ENGINE {
+         }
+ 
+         PluginState = "GameLoop_End";
++        if (QaRole("host") || QaRole("client")) {
++            static DWORD last=0;
++            if(GetTickCount()-last>1000) {
++                last=GetTickCount();
++                json state;state["tick"]=last;state["role"]=QaRole("host")?"host":"client";
++                state["id"]=MyselfId.ToChar();state["synced_npcs"]=SyncNpcs.size();state["players"]=PlayerNpcs.size();
++                state["remote_players"]=json::array();
++                for(auto pair:PlayerNpcs) {
++                    auto pos=pair.first->GetPositionWorld();
++                    state["remote_players"].push_back({{"name",pair.second.ToChar()},{"x",pos[0]},{"y",pos[1]},{"z",pos[2]}});
++                }
++                std::ofstream out("GothicCoopQA.json");out<<state.dump(2);
++            }
++        }
+     }
+ 
+     void Game_SaveBegin() {
+diff --git a/Server.cpp b/Server.cpp
+index 6e423ca..482298d 100644
+--- a/Server.cpp
++++ b/Server.cpp
+@@ -10,7 +10,7 @@ namespace GOTHIC_ENGINE {
+ 
+         ENetAddress address;
+         ENetHost* server;
+-        enet_address_set_host(&address, "0.0.0.0");
++        enet_address_set_host(&address, CoopConfig.value("loopbackOnly", false) ? "127.0.0.1" : "0.0.0.0");
+         address.port = ConnectionPort;
+         server = enet_host_create(&address, 32, 2, 0, 0);
+         if (server == NULL)
+@@ -67,4 +67,4 @@ namespace GOTHIC_ENGINE {
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/UnionHooks.cpp b/UnionHooks.cpp
+index c9786b6..8436704 100644
+--- a/UnionHooks.cpp
++++ b/UnionHooks.cpp
+@@ -30,6 +30,14 @@ namespace GOTHIC_ENGINE {
+     }
+ 
+     void _Game_MenuLoop() {
++        if(QaRole("host") || QaRole("client")) {
++            static bool started=false;
++            auto menu=zCMenu::GetActive();
++            if(!started && menu && menu->GetName()=="MENU_MAIN") {
++                started=true;
++                menu->ForceSelAction(SEL_ACTION_CLOSE,"NEW_GAME",NULL);
++            }
++        }
+     }
+ 
+     void _Game_SaveBegin() {
+@@ -175,4 +183,4 @@ namespace GOTHIC_ENGINE {
+         Enabled(AppDefault) _Game_DefineExternals,
+         Enabled(AppDefault) _Game_ApplyOptions
+     );
+-}
+\ No newline at end of file
++}

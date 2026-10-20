@@ -1,0 +1,8 @@
+vendor/
+build/
+steam-build/
+steam-tests/
+local/
+downloads/
+dist/
+*.log
