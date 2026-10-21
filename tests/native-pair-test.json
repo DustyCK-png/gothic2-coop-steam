@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "transport": "two real Gothic processes, local ENet; IPC controller substitutes for relay",
+  "two_clients_connected": true,
+  "client_manual_save_blocked": true,
+  "client_manual_load_blocked": true,
+  "captured_while_connected": true,
+  "restored_hero": {
+    "chapter": 3,
+    "gold": 137,
+    "learn_points": 19,
+    "strength": 73
+  },
+  "stable_after_restore": true,
+  "reconnected_after_restore": true,
+  "dll_sha256": "82588d85baa97ed8e08b627d1c9564176339fde7dd197cb7b4ddbf538aafc945"
+}

@@ -1,0 +1,19 @@
+{
+  "game": "Gothic II NotR 2.6 (fix)",
+  "union": "1.0m",
+  "steam_init_inside_game": "passed",
+  "is_overlay_enabled": true,
+  "shift_tab_visual_confirmation": "confirmed by owner",
+  "invite_delivery": "not tested",
+  "real_two_account_gameplay": "not tested",
+  "relay_regression": {
+    "status": "passed",
+    "transport": "Steam API mock, not real Steam",
+    "packet_sizes": [
+      1,
+      64,
+      1400,
+      16000
+    ]
+  }
+}

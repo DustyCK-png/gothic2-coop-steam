@@ -1,9 +1,331 @@
+diff --git a/HostSaves.cpp b/HostSaves.cpp
+new file mode 100644
+--- /dev/null
++++ b/HostSaves.cpp
+@@ -0,0 +1,237 @@
++// SPDX-License-Identifier: AGPL-3.0-or-later
++// Experimental host-owned checkpoints. Never installed over the stable mod until QA passes.
++namespace GOTHIC_ENGINE {
++    namespace HostSaves {
++        namespace fs=std::filesystem;
++        static std::string redirectedCurrent;
++        static bool nativeIO=false;
++        static int pendingSaveEvent=-1;
++        static bool flushingSaveEvent=false;
++        static bool autoStartPending=false,autoStartSawDialogue=false,autoSaving=false;
++        static DWORD autoStartReadySince=0;
++        static fs::path Ipc() {char path[MAX_PATH]={0};GetEnvironmentVariableA("G2_COOP_CAMPAIGN",path,sizeof path);return fs::path(path);}
++        static bool IsHost() {char host[4]={0};GetEnvironmentVariableA("G2_COOP_CAMPAIGN_HOST",host,sizeof host);return host[0]=='1';}
++        static bool CanConnect() {auto p=Ipc();return p.empty()||IsHost()||fs::exists(p.string()+".ready");}
++        static void Atomic(const fs::path& path,const json& value){auto tmp=path;tmp+=".tmp";{std::ofstream out(tmp,std::ios::binary);out<<value.dump(2);if(!out)throw std::runtime_error("Cannot write save IPC");}if(!MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))throw std::runtime_error("Cannot commit save IPC");}
++        static void Event(const char* event,int slot) {if(!strcmp(event,"save")&&!flushingSaveEvent){pendingSaveEvent=slot;return;}auto p=Ipc();if(p.empty()||!IsHost()||nativeIO)return;if(!strcmp(event,"new")){autoStartPending=true;autoStartSawDialogue=false;autoStartReadySince=0;}else if(!strcmp(event,"load"))autoStartPending=false;if(slot>=0){char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);auto dir=fs::path(exe).parent_path().parent_path()/"Saves"/(slot==0?"quicksave":"savegame"+std::to_string(slot));if(!strcmp(event,"save"))SharedGameplay::Save(dir);else if(!strcmp(event,"load"))SharedGameplay::Load(dir);}Atomic(p.string()+".event",{{"event",event},{"slot",slot}});}
++        static LONG CALLBACK TraceException(EXCEPTION_POINTERS* ex) {
++            if(ex->ExceptionRecord->ExceptionCode==EXCEPTION_ACCESS_VIOLATION) {
++                char buffer[256];auto c=ex->ContextRecord;
++                sprintf_s(buffer,"AV eip=%08lX ecx=%08lX eax=%08lX address=%08lX",c->Eip,c->Ecx,c->Eax,(DWORD)ex->ExceptionRecord->ExceptionInformation[1]);
++                char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);
++                std::ofstream out(fs::path(exe).parent_path()/"HostSaveException.log",std::ios::app);out<<buffer<<"\n";
++                out<<"plugin="<<PluginState<<"\n";
++                CONTEXT context=*c;STACKFRAME64 frame={};frame.AddrPC={context.Eip,0,AddrModeFlat};frame.AddrFrame={context.Ebp,0,AddrModeFlat};frame.AddrStack={context.Esp,0,AddrModeFlat};
++                for(int i=0;i<24&&StackWalk64(IMAGE_FILE_MACHINE_I386,GetCurrentProcess(),GetCurrentThread(),&frame,&context,nullptr,SymFunctionTableAccess64,SymGetModuleBase64,nullptr);++i){char address[40];sprintf_s(address,"%08llX",frame.AddrPC.Offset);out<<address;char symbols[sizeof(SYMBOL_INFO)+1024]={0};auto info=(SYMBOL_INFO*)symbols;info->SizeOfStruct=sizeof(SYMBOL_INFO);info->MaxNameLen=1023;DWORD64 offset=0;if(SymFromAddr(GetCurrentProcess(),frame.AddrPC.Offset,&offset,info))out<<" "<<info->Name<<"+"<<offset;out<<"\n";}
++            }
++            return EXCEPTION_CONTINUE_SEARCH;
++        }
++        static fs::path SaveRoot() {
++            char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);
++            auto game=fs::path(exe).parent_path().parent_path();
++            fs::path configured(zoptions->GetDirString(DIR_SAVEGAMES).ToChar());
++            return configured.is_absolute()?configured:(game/configured.relative_path()).lexically_normal();
++        }
++        static void Log(const std::string& message) {
++            char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);
++            fs::path path=fs::path(exe).parent_path()/"HostSave.log";
++            std::ofstream out(path,std::ios::app);out<<GetTickCount()<<" "<<message<<"\n";
++        }
++        static CInvoke<zSTRING(oCSavegameManager::*)(int)> OriginalSlotDir(0x004397B0,&oCSavegameManager::GetSlotDirName_HostSave);
++        static CInvoke<zSTRING(oCSavegameInfo::*)()> OriginalInfoDir(0x00437310,&oCSavegameInfo::GetDir_HostSave);
++        static CInvoke<void(oCSavegameManager::*)(int)> OriginalCopyToCurrent(0x00439310,&oCSavegameManager::CopyToCurrent_HostSave);
++        static CInvoke<void(CGameManager::*)(int)> OriginalWrite(0x0042A2D0,&CGameManager::Write_Savegame_HostOnly);
++        static CInvoke<void(CGameManager::*)(int)> OriginalRead(0x0042A040,&CGameManager::Read_Savegame_HostOnly);
++        struct Redirect {
++            char cwd[MAX_PATH];
++            Redirect(const fs::path& directory) {
++                GetCurrentDirectoryA(MAX_PATH,cwd);
++                redirectedCurrent=directory.filename().string()+"\\";nativeIO=true;
++            }
++            ~Redirect(){nativeIO=false;redirectedCurrent.clear();SetCurrentDirectoryA(cwd);}
++        };
++        static fs::path Capture() {
++            auto root=SaveRoot();
++            auto target=root/("coop-capture-"+std::to_string(GetTickCount()));
++            fs::create_directories(target);
++            auto current=root/"current";
++            if(fs::exists(current))for(auto& item:fs::directory_iterator(current)) {
++                if(item.is_regular_file())fs::copy_file(item.path(),target/item.path().filename());
++            }
++            Log("capture begin: "+target.string());
++            {
++                Redirect guard(target);
++                ogame->WriteSavegame(-1,1);
++            }
++            SharedGameplay::Save(target);
++            size_t bytes=0,files=0;
++            for(auto& item:fs::directory_iterator(target))if(item.is_regular_file()){bytes+=item.file_size();++files;}
++            Log("capture complete: files="+std::to_string(files)+" bytes="+std::to_string(bytes));
++            if(!files || !bytes)throw std::runtime_error("Engine produced an empty snapshot");
++            return target;
++        }
++        static fs::path Restore(const fs::path& directory) {
++            if(ServerThread || ClientThread)throw std::runtime_error("Restore must finish before game networking starts");
++            auto& information=oCInformationManager::GetInformationManager();
++            if(!information.HasFinished()||information.WaitingForEnd())throw std::runtime_error("Wait until the dialogue has fully finished before restoring");
++            if(!fs::equivalent(directory.parent_path(),SaveRoot()))throw std::runtime_error("Restore directory outside isolated save root");
++            Log("restore begin: "+directory.string());
++            LoadBegin();
++            gameMan->exitSession=0;
++            ogame->SetGameInfo(nullptr);
++            {
++                Redirect guard(directory);
++                auto manager=gameMan->savegameManager;
++                auto original=manager->localInfo;
++                auto temporary=original?nullptr:new oCSavegameInfo(-1);
++                if(temporary){manager->localInfo=temporary;Log("created temporary current-slot metadata");}
++                ogame->LoadSavegame(-1,1);
++                if(temporary){manager->localInfo=original;temporary->Release();}
++            }
++            // Later level transitions read the normal current directory. Preserve its old
++            // contents, then seed it from this checkpoint's visited-world archives.
++            auto current=SaveRoot()/"current";
++            fs::path backup;
++            if(fs::exists(current)){backup=SaveRoot()/("coop-before-restore-"+std::to_string(GetTickCount()));fs::rename(current,backup);}
++            fs::create_directories(current);
++            for(auto& item:fs::directory_iterator(directory))if(item.is_regular_file())fs::copy_file(item.path(),current/item.path().filename());
++            Game_LoadEnd_SaveGame();
++            SharedGameplay::Load(directory);
++            Log("restore complete");
++            return backup;
++        }
++        static json HeroState() {
++            int chapter=0;auto symbol=parser->GetSymbol("KAPITEL");if(symbol)symbol->GetValue(chapter,0);
++            auto gold=player->IsInInv(zSTRING("ITMI_GOLD"),1);
++            return {{"strength",player->attribute[NPC_ATR_STRENGTH]},
++                {"learn_points",player->learn_points},{"gold",gold?gold->amount:0},{"chapter",chapter}};
++        }
++        static void QaReport(const json& data) {
++            char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);
++            std::ofstream out(fs::path(exe).parent_path()/"HostSaveQA.json");out<<data.dump(2);
++        }
++        static void Tick() {
++            static auto handler=AddVectoredExceptionHandler(1,TraceException);
++            if(autoSaving)return;
++            if(pendingSaveEvent>=0&&!IsSavingGame&&!nativeIO){int slot=pendingSaveEvent;pendingSaveEvent=-1;flushingSaveEvent=true;Event("save",slot);flushingSaveEvent=false;}
++            auto ipc=Ipc();
++            if(autoStartPending&&IsHost()&&!nativeIO&&!IsLoadingLevel&&player&&ogame->GetWorld()) {
++                auto& info=oCInformationManager::GetInformationManager();
++                auto xardas=parser->GetIndex("NONE_100_XARDAS");
++                if(xardas>=0&&info.Npc&&info.Npc->GetInstance()==xardas)autoStartSawDialogue=true;
++                bool finished=autoStartSawDialogue&&info.HasFinished()&&!info.WaitingForEnd()&&!IsPlayerTalkingWithAnybody()&&!IsSavingGame&&SharedGameplay::CanSave();
++                if(!finished)autoStartReadySince=0;
++                else if(!autoStartReadySince)autoStartReadySince=GetTickCount();
++                else if(GetTickCount()-autoStartReadySince>=2000) {
++                    autoStartPending=false;int slot=-1;
++                    for(int i=20;i>=1;--i){auto info=gameMan->savegameManager->GetSavegame(i);if(info&&info->m_SlotNr==i&&!info->DoesSavegameExist()&&!fs::exists(SaveRoot()/("savegame"+std::to_string(i)))){slot=i;break;}}
++                    if(slot<0)ChatLog("Host saves: no free slot for the starting checkpoint. Save manually.");
++                    else {
++                        struct SavingGuard {SavingGuard(){autoSaving=true;}~SavingGuard(){autoSaving=false;}} guard;
++                        gameMan->savegameManager->GetSavegame(slot)->m_Name=zSTRING("Co-op: after Xardas");
++                        gameMan->Write_Savegame(slot);Event("save",slot);
++                        ChatLog(("Host saves: starting checkpoint written to slot "+std::to_string(slot)+".").c_str());
++                    }
++                }
++            }
++            // Only the automated test role skips the introduction conversation.
++            if(QaRole("checkpoint")&&!autoStartSawDialogue&&!ipc.empty()&&fs::exists(ipc.string()+".command"))return;
++            if((QaRole("client")||QaRole("checkpoint"))&&!ipc.empty()&&player&&!IsLoadingLevel&&fs::exists(ipc.string()+".command")) {
++                auto& info=oCInformationManager::GetInformationManager();
++                if(IsPlayerTalkingWithAnybody()||!info.HasFinished()||info.WaitingForEnd()){info.Exit();info.OnTermination();return;}
++            }
++            if(!ipc.empty()&&player&&!IsLoadingLevel) {
++                static DWORD nextStatus=0;static std::string previous;
++                if((LONG)(GetTickCount()-nextStatus)>=0) {
++                    nextStatus=GetTickCount()+500;
++                    try {auto path=fs::path(ipc.string()+".status");if(fs::exists(path)){json state;std::ifstream in(path);in>>state;auto message=state.value("state","")+": "+state.value("detail","");if(message!=previous){previous=message;ChatLog(("Host saves: "+message).c_str());}}}catch(const std::exception&){}
++                }
++            }
++            if(!ipc.empty()&&!nativeIO&&!IsLoadingLevel&&player&&ogame->GetWorld()&&!IsPlayerTalkingWithAnybody()&&oCInformationManager::GetInformationManager().HasFinished()&&!oCInformationManager::GetInformationManager().WaitingForEnd()) {
++                auto command=fs::path(ipc.string()+".command");
++                if(fs::exists(command)) {
++                    json reply;
++                    try {
++                        json request;{std::ifstream in(command);in>>request;}fs::remove(command);
++                        reply={{"op",request.at("op")},{"id",request.at("id")},{"ok",true}};
++                        if(request.at("op")=="capture"){reply["path"]=Capture().u8string();reply["hero"]=HeroState();}
++                        else if(request.at("op")=="restore"){auto backup=Restore(fs::u8path(request.at("path").get<std::string>()));reply["hero"]=HeroState();reply["previous_cache"]=backup.u8string();}
++                        else if(request.at("op")=="qa-save-local"&&QaRole("client")){gameMan->Write_Savegame(request.at("slot"));}
++                        else if(request.at("op")=="qa-load-local"&&QaRole("client")){gameMan->Read_Savegame(request.at("slot"));reply["hero"]=HeroState();}
++                        else if(request.at("op")=="qa-set"&&QaRole("client")){
++                            player->attribute[NPC_ATR_STRENGTH]=73;player->learn_points=19;
++                            auto gold=player->IsInInv(zSTRING("ITMI_GOLD"),1);if(gold)player->RemoveFromInv(gold,gold->amount);
++                            player->CreateItems(parser->GetIndex("ITMI_GOLD"),137);
++                            auto chapter=parser->GetSymbol("KAPITEL");if(chapter)chapter->SetValue(3,0);
++                            reply["hero"]=HeroState();
++                        }
++                        else if(request.at("op")=="qa-finish"&&QaRole("checkpoint")){reply["hero"]=HeroState();}
++                        else throw std::runtime_error("Unknown native save command");
++                    }catch(const std::exception& e){reply["ok"]=false;reply["error"]=e.what();Log(e.what());}
++                    Atomic(ipc.string()+".reply",reply);
++                }
++            }
++            if(nativeIO || !QaRole("save") || IsLoadingLevel || !player || !ogame->GetWorld())return;
++            static int stage=0;
++            static DWORD first=GetTickCount();
++            static fs::path snapshot;
++            static json expected;
++            try {
++                if(stage==0) {
++                    static bool logging=false;if(!logging){logging=true;zerr->SetTarget(zERR_TARGET_FILE);zerr->SetFilterLevel(9);}
++                    if(GetTickCount()-first<5000)return;
++                    auto& info=oCInformationManager::GetInformationManager();
++                    if(IsPlayerTalkingWithAnybody()||!info.HasFinished()||info.WaitingForEnd()){info.Exit();info.OnTermination();return;}
++                    player->attribute[NPC_ATR_STRENGTH]=73;player->learn_points=19;
++                    auto gold=player->IsInInv(zSTRING("ITMI_GOLD"),1);
++                    if(gold)player->RemoveFromInv(gold,gold->amount);
++                    player->CreateItems(parser->GetIndex("ITMI_GOLD"),137);
++                    auto chapter=parser->GetSymbol("KAPITEL");if(chapter)chapter->SetValue(3,0);
++                    expected=HeroState();snapshot=Capture();stage=1;
++                    QaReport({{"status","captured"},{"expected",expected},{"path",snapshot.string()}});
++                } else if(stage==1) {
++                    player->attribute[NPC_ATR_STRENGTH]=12;player->learn_points=1;
++                    auto chapter=parser->GetSymbol("KAPITEL");if(chapter)chapter->SetValue(1,0);
++                    auto gold=player->IsInInv(zSTRING("ITMI_GOLD"),1);if(gold)player->RemoveFromInv(gold,gold->amount);
++                    stage=2;Restore(snapshot);
++                } else if(stage==2) {
++                    static DWORD verifyStart=GetTickCount();auto actual=HeroState();
++                    if(actual!=expected){stage=3;QaReport({{"status","failed"},{"expected",expected},{"actual",actual}});}
++                    else if(GetTickCount()-verifyStart>=10000){stage=3;QaReport({{"status","passed"},{"expected",expected},{"actual",actual},{"path",snapshot.string()},{"stable_ms",GetTickCount()-verifyStart}});}
++                    else QaReport({{"status","verifying"},{"expected",expected},{"actual",actual}});
++                }
++            } catch(const std::exception& error) {stage=3;Log(error.what());QaReport({{"status","failed"},{"error",error.what()}});}
++        }
++    }
++    zSTRING oCSavegameManager::GetSlotDirName_HostSave(int slot) {
++        if(HostSaves::nativeIO && slot==-1)return zSTRING(HostSaves::redirectedCurrent.c_str());
++        auto original=HostSaves::OriginalSlotDir.ReinterpretTo();
++        return (this->*original)(slot);
++    }
++    zSTRING oCSavegameInfo::GetDir_HostSave() {
++        if(HostSaves::nativeIO && m_SlotNr==-1)return zSTRING(HostSaves::redirectedCurrent.c_str());
++        auto original=HostSaves::OriginalInfoDir.ReinterpretTo();
++        return (this->*original)();
++    }
++    void oCSavegameManager::CopyToCurrent_HostSave(int slot) {
++        if(HostSaves::nativeIO && slot==-1){zoptions->ChangeDir(DIR_SAVEGAMES);HostSaves::Log("private snapshot already current; selected save directory without slot-array copy");return;}
++        auto original=HostSaves::OriginalCopyToCurrent.ReinterpretTo();
++        (this->*original)(slot);
++    }
++    void CGameManager::Write_Savegame_HostOnly(int slot) {
++        if(!SharedGameplay::CanSave()){ChatLog("Finish the active party dialogue before saving.");return;}
++        if(!HostSaves::Ipc().empty()&&!HostSaves::IsHost()){
++            ChatLog("Only the host can save this campaign.");HostSaves::Log("Blocked client manual save: "+std::to_string(slot));return;
++        }
++        auto original=HostSaves::OriginalWrite.ReinterpretTo();(this->*original)(slot);
++    }
++    void CGameManager::Read_Savegame_HostOnly(int slot) {
++        if(!HostSaves::Ipc().empty()&&HostSaves::IsHost()&&(ServerThread||ClientThread)){
++            ChatLog("Restart the co-op session before loading another host checkpoint.");return;
++        }
++        if(!HostSaves::Ipc().empty()&&!HostSaves::IsHost()&&ClientThread){
++            ChatLog("Only the host can load campaign progress. Rejoin to restore your character.");HostSaves::Log("Blocked client manual load: "+std::to_string(slot));return;
++        }
++        auto original=HostSaves::OriginalRead.ReinterpretTo();(this->*original)(slot);
++    }
++}
+diff --git a/Interface.cpp b/Interface.cpp
+--- a/Interface.cpp
++++ b/Interface.cpp
+@@ -8,6 +8,10 @@
+ #include <intrin.h>
+ #include <DbgHelp.h>
+ #include <ctime>
++#include <filesystem>
++#include <set>
++#include <map>
++#include <fstream>
+ 
+ #include "UnionAfx.h"
+ #include <gdiplus.h>
+@@ -74,4 +78,4 @@
+ #define GOTHIC_ENGINE Gothic_II_Addon
+ #define ENGINE Engine_G2A
+ #include "Sources.h"
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/LocalNpc.cpp b/LocalNpc.cpp
+--- a/LocalNpc.cpp
++++ b/LocalNpc.cpp
+@@ -389,8 +389,11 @@
+                     j["x"] = lastPosition.n[0];
+                     j["y"] = lastPosition.n[1];
+                     j["z"] = lastPosition.n[2];
+-                    j["bodyTextVarNr"] = MyBodyTextVarNr;
+-                    j["headVarNr"] = MyHeadVarNr;
++                    j["bodyTextVarNr"] = int(npc->body_TexVarNr);
++                    j["headVarNr"] = int(npc->head_TexVarNr);
++                    j["bodyColor"] = int(npc->body_TexColorNr);
++                    j["bodyVisual"] = npc->body_visualName.ToChar();
++                    j["headVisual"] = npc->head_visualName.ToChar();
+                     break;
+                 }
+                 case SYNC_POS:
+@@ -563,4 +566,4 @@
+             } 
+         }
+     };
+-}
+\ No newline at end of file
++}
+diff --git a/PacketProcessor.cpp b/PacketProcessor.cpp
+--- a/PacketProcessor.cpp
++++ b/PacketProcessor.cpp
+@@ -1,5 +1,6 @@
+ namespace GOTHIC_ENGINE {
+     void ProcessCoopPacket(json e, ENetEvent packet) {
++        if(SharedGameplay::Control(e)){SharedGameplay::Packet(e,packet);return;}
+         auto id = e["id"].get<std::string>();
+         auto type = e["type"].get<int>();
+         auto npcToSync = SyncNpcs.count(id.c_str()) ? SyncNpcs[id.c_str()] : NULL;
+@@ -91,7 +92,7 @@
+             auto j = json::from_bson(bytesVector);
+             j["id"] = player->name.ToChar();
+ 
+-            ReadyToBeDistributedPackets.enqueue(j);
++            if(!SharedGameplay::Control(j))ReadyToBeDistributedPackets.enqueue(j);
+             ProcessCoopPacket(j, packet);
+             SaveNetworkPacket(j.dump(-1, ' ', false, json::error_handler_t::ignore).c_str());
+             break;
+@@ -99,6 +100,8 @@
+         case ENET_EVENT_TYPE_DISCONNECT:
+         {
+             auto remoteNpc = (PeerData*)(packet.peer->data);
++            if(!remoteNpc)break;
++            SharedGameplay::PeerLeft(remoteNpc->name.ToChar());
+             ChatLog(string::Combine("%s disconnected.", remoteNpc->name));
+ 
+             json j;
+@@ -159,4 +162,4 @@
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/Plugin.cpp b/Plugin.cpp
-index b098afe..de3ef43 100644
 --- a/Plugin.cpp
 +++ b/Plugin.cpp
 @@ -1,6 +1,10 @@
- ﻿#include "resource.h"
+-﻿#include "resource.h"
++#include "resource.h"
  
  namespace GOTHIC_ENGINE {
 +    bool QaRole(const char* role) {
@@ -13,7 +335,33 @@ index b098afe..de3ef43 100644
      void Game_Entry() {
          GetCurrentDirectory(MAX_PATH, GothicExeFolderPath);
  
-@@ -138,10 +142,10 @@ namespace GOTHIC_ENGINE {
+@@ -83,6 +87,7 @@
+         GameChat->Render();
+         GameStatsLoop();
+         PacketProcessorLoop();
++        SharedGameplay::Tick();
+         DamageProcessorLoop();
+         SpellCastProcessorLoop();
+         ReviveFriendLoop();
+@@ -113,13 +118,13 @@
+             }
+ 
+             PluginState = "UpdateSyncNpcs";
+-            for (auto const& pair : SyncNpcs) {
+-                auto npc = pair.second;
++            for (auto it=SyncNpcs.begin();it!=SyncNpcs.end();) {
++                auto npc = it->second;
+                 npc->Update();
+ 
+                 if (npc->destroyed) {
+-                    SyncNpcs.erase(pair.first);
+-                }
++                    it=SyncNpcs.erase(it);
++                }else ++it;
+             }
+ 
+             PluginState = "DisplayPing";
+@@ -138,21 +143,21 @@
  
          PluginState = "KeysPressedChecks";
          if (!IsPlayerTalkingWithAnybody() && !WorldEditMode) {
@@ -26,16 +374,30 @@ index b098afe..de3ef43 100644
  
                  Thread t;
                  t.Init(&CoopServerThread);
-@@ -151,7 +155,7 @@ namespace GOTHIC_ENGINE {
-                 player->SetAdditionalVisuals(zSTRING("hum_body_Naked0"), MyBodyTextVarNr, DefaultBodyTexColorNr, zSTRING("HUM_HEAD_PONY"), MyHeadVarNr, 0, -1);
-             }
- 
+                 t.Detach();
+                 ServerThread = &t;
+                 MyselfId = "HOST";
+-                player->SetAdditionalVisuals(zSTRING("hum_body_Naked0"), MyBodyTextVarNr, DefaultBodyTexColorNr, zSTRING("HUM_HEAD_PONY"), MyHeadVarNr, 0, -1);
+-            }
+-
 -            if (zinput->KeyToggled(StartConnectionKey) && !ServerThread) {
-+            if ((zinput->KeyToggled(StartConnectionKey) || (QaRole("client") && !ClientThread)) && !ServerThread) {
++            }
++
++            if ((zinput->KeyToggled(StartConnectionKey) || (QaRole("client") && !ClientThread) || CoopSteam::connectPending) && !ServerThread && HostSaves::CanConnect()) {
                  if (!ClientThread) {
++                    CoopSteam::connectPending=false;
                      addSyncedNpc("HOST");
  
-@@ -232,6 +236,20 @@ namespace GOTHIC_ENGINE {
+                     Thread  t;
+@@ -162,7 +167,6 @@
+ 
+                     ogame->SetTime(ogame->GetWorldTimer()->GetDay(), 12, 00);
+                     rtnMan->RestartRoutines();
+-                    player->SetAdditionalVisuals(zSTRING("hum_body_Naked0"), MyBodyTextVarNr, DefaultBodyTexColorNr, zSTRING("HUM_HEAD_PONY"), MyHeadVarNr, 0, -1);
+                 }
+                 else {
+                     if (IsCoopPaused) {
+@@ -232,6 +236,20 @@
          }
  
          PluginState = "GameLoop_End";
@@ -56,11 +418,253 @@ index b098afe..de3ef43 100644
      }
  
      void Game_SaveBegin() {
+diff --git a/RemoteNpc.cpp b/RemoteNpc.cpp
+--- a/RemoteNpc.cpp
++++ b/RemoteNpc.cpp
+@@ -4,10 +4,13 @@
+     public:
+         string name;
+         string playerNickname = "";
+-        int playerHeadVarNr;
+-        int playerBodyTextVarNr;
++        int playerHeadVarNr=0;
++        int playerBodyTextVarNr=0,playerBodyColor=0;
++        zSTRING playerBodyVisual="hum_body_Naked0",playerHeadVisual="HUM_HEAD_PONY";
++        zCArray<int> cachedOverlays;
+         oCNpc* npc = NULL;
+         bool destroyed = false;
++        bool qaWasDespawned=false;
+         bool isSpawned = false;
+         bool hasNpc = false;
+         bool hasModel = false;
+@@ -50,7 +53,7 @@
+                 return;
+             }
+ 
+-            for (unsigned int i = 0; i < localUpdates.size(); i++)
++            while (!localUpdates.empty())
+             {
+                 auto update = localUpdates.front();
+                 localUpdates.erase(localUpdates.begin());
+@@ -181,7 +184,10 @@
+                 playerNickname = nickname.c_str();
+                 playerHeadVarNr = headNumber;
+                 playerBodyTextVarNr = bodyNumber;
+-                lastPositionFromServer = new zVEC3(x, y, z);
++                playerBodyColor=update.value("bodyColor",0);
++                playerBodyVisual=update.value("bodyVisual",std::string("hum_body_Naked0")).c_str();
++                playerHeadVisual=update.value("headVisual",std::string("HUM_HEAD_PONY")).c_str();
++                if(!lastPositionFromServer)lastPositionFromServer=new zVEC3(x,y,z);else *lastPositionFromServer=zVEC3(x,y,z);
+ 
+                 if (IsCoopPlayer(name)) {
+                     InitCoopFriendNpc();
+@@ -208,7 +214,7 @@
+                 }
+             }
+ 
+-            lastPositionFromServer = new zVEC3(x, y, z);
++            if(!lastPositionFromServer)lastPositionFromServer=new zVEC3(x,y,z);else *lastPositionFromServer=zVEC3(x,y,z);
+         }
+ 
+         void UpdateAngle(json update) {
+@@ -310,6 +316,7 @@
+         }
+ 
+         void UpdateArmor(json update) {
++            auto armorName=update["armor"].get<std::string>();lastArmor=armorName=="NULL"?-1:parser->GetIndex(armorName.c_str());
+             if (hasNpc) {
+                 auto armor = update["armor"].get<std::string>();
+ 
+@@ -341,6 +348,7 @@
+         }
+ 
+         void UpdateOverlays(json update) {
++            cachedOverlays.DeleteList();for(auto& a:update["overlays"])cachedOverlays.InsertEnd(a["over"].get<int>());
+             if (hasNpc) {
+                 std::vector<json> overlays = update["overlays"];
+                 zCArray<int> overlaysNew;
+@@ -440,6 +448,8 @@
+         }
+ 
+         void UpdateWeapons(json update) {
++            auto w1=update["w1"].get<std::string>(),w2=update["w2"].get<std::string>();
++            lastWeapon1=w1=="NULL"?-1:parser->GetIndex(w1.c_str());lastWeapon2=w2=="NULL"?-1:parser->GetIndex(w2.c_str());
+             if (hasModel) {
+                 auto weapon1 = update["w1"].get<std::string>();
+                 auto weapon2 = update["w2"].get<std::string>();
+@@ -515,10 +525,11 @@
+         }
+ 
+         void UpdateAttacks(json update) {
+-            if (!hasModel) {
+-                return;
+-            }
+-
++            if (!hasModel && !IsCoopPlayer(name)) {
++                return;
++            }
++
++            auto attacker=npc?npc:player;
+             std::vector<json> atts = update["att"];
+             for each (auto a in atts) {
+                 auto target = a["target"].get<std::string>();
+@@ -532,23 +543,23 @@
+                     auto targetNpc = player;
+                     int health = targetNpc->GetAttribute(NPC_ATR_HITPOINTS);
+ 
+-                    if (player->GetAnictrl()->CanParade(npc)) {
++                    if (player->GetAnictrl()->CanParade(attacker)) {
+                         break;
+                     }
+ 
+                     if (isUnconscious && stillAlive) {
+                         targetNpc->SetWeaponMode2(NPC_WEAPON_NONE);
+-                        targetNpc->DropUnconscious(1, npc);
++                        targetNpc->DropUnconscious(1, attacker);
+                     }
+ 
+                     if (stillAlive) {
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, 999999);
+-                        targetNpc->GetEM(false)->OnDamage(targetNpc, npc, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
++                        targetNpc->GetEM(false)->OnDamage(targetNpc, attacker, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, health - damage);
+                     }
+                     else {
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, 1);
+-                        targetNpc->GetEM(false)->OnDamage(targetNpc, npc, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
++                        targetNpc->GetEM(false)->OnDamage(targetNpc, attacker, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
+                     }
+ 
+                     break;
+@@ -561,17 +572,17 @@
+ 
+                     if (isUnconscious && stillAlive) {
+                         targetNpc->SetWeaponMode2(NPC_WEAPON_NONE);
+-                        targetNpc->DropUnconscious(1, npc);
++                        targetNpc->DropUnconscious(1, attacker);
+                     }
+ 
+                     if (stillAlive) {
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, 999999);
+-                        targetNpc->GetEM(false)->OnDamage(targetNpc, npc, 1, damageMode, targetNpc->GetPositionWorld());
++                        targetNpc->GetEM(false)->OnDamage(targetNpc, attacker, 1, damageMode, targetNpc->GetPositionWorld());
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, health);
+                     }
+                     else {
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, 0);
+-                        targetNpc->DoDie(npc);
++                        targetNpc->DoDie(attacker);
+                     }
+ 
+                     break;
+@@ -580,6 +591,7 @@
+                 // attack any world npc (eg. client attacks Moe, Cavalorn attacks goblin, wolf attacks sheep)
+                 auto targetNpc = UniqueNameToNpcList[target.c_str()];
+                 if (targetNpc) {
++                    if(!stillAlive && targetNpc->IsDead())continue;
+                     int health = targetNpc->GetAttribute(NPC_ATR_HITPOINTS);
+                     auto isTalkingWith = IsPlayerTalkingWithNpc(targetNpc);
+                     static int AIV_PARTYMEMBER = GetPartyMemberID();
+@@ -587,18 +599,18 @@
+                     if (isUnconscious && stillAlive) {
+                         targetNpc->SetWeaponMode2(NPC_WEAPON_NONE);
+ 
+-                        if (IsCoopPlayer(npc->GetObjectName()) || npc->aiscriptvars[AIV_PARTYMEMBER] == True) {
++                        if (IsCoopPlayer(name) || attacker->aiscriptvars[AIV_PARTYMEMBER] == True) {
+                             targetNpc->DropUnconscious(1, player);
+                         }
+                         else {
+-                            targetNpc->DropUnconscious(1, npc);
++                            targetNpc->DropUnconscious(1, attacker);
+                         }
+                     }
+ 
+                     if (stillAlive) {
+                         if (!isTalkingWith && !isUnconscious) {
+                             targetNpc->SetAttribute(NPC_ATR_HITPOINTS, 999999);
+-                            targetNpc->GetEM(false)->OnDamage(targetNpc, npc, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
++                            targetNpc->GetEM(false)->OnDamage(targetNpc, attacker, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
+                         }
+                         if (ServerThread) {
+                             targetNpc->SetAttribute(NPC_ATR_HITPOINTS, health - damage > 0 ? health - damage : 0);
+@@ -607,7 +619,7 @@
+                     else {
+                         targetNpc->SetAttribute(NPC_ATR_HITPOINTS, 1);
+ 
+-                        if (IsCoopPlayer(npc->GetObjectName()) || npc->aiscriptvars[AIV_PARTYMEMBER] == True) {
++                        if (IsCoopPlayer(name) || attacker->aiscriptvars[AIV_PARTYMEMBER] == True) {
+                             targetNpc->OnDamage(targetNpc, player, COOP_MAGIC_NUMBER, damageMode, targetNpc->GetPositionWorld());
+                         }
+ 
+@@ -708,6 +720,7 @@
+         }
+ 
+         void DestroyNpc() {
++            destroyed=true;
+             if (npc != NULL) {
+                 PlayerNpcs.erase(npc);
+                 PlayerNameToNpc.erase(name);
+@@ -716,6 +729,7 @@
+                 destroyed = true;
+                 npc = NULL;
+             }
++            hasNpc=false;hasModel=false;isSpawned=false;
+         }
+ 
+         void UpdateNpcBasedOnLastDataFromServer() {
+@@ -802,6 +816,7 @@
+                 npc = dynamic_cast<oCNpc*>(ogame->GetGameWorld()->CreateVob(zTVobType::zVOB_TYPE_NSC, instanceId));
+             }
+ 
++            if(!npc||!lastPositionFromServer)return;
+             ogame->spawnman->InsertNpc(npc, *lastPositionFromServer);
+             isSpawned = true;
+             npc->name[0] = playerNickname.IsEmpty() ? zSTRING(name) : playerNickname;
+@@ -815,7 +830,8 @@
+             npc->dontWriteIntoArchive = TRUE;
+             npc->idx = 69133769;
+ 
+-            npc->SetAdditionalVisuals(zSTRING("hum_body_Naked0"), playerBodyTextVarNr, DefaultBodyTexColorNr, zSTRING("HUM_HEAD_PONY"), playerHeadVarNr, 0, -1);
++            npc->SetAdditionalVisuals(playerBodyVisual,playerBodyTextVarNr,playerBodyColor,playerHeadVisual,playerHeadVarNr,0,-1);
++            npc->ApplyOverlaysArray(cachedOverlays);
+ 
+ #if ENGINE >= Engine_G2
+             npc->SetHitChance(1, 100);
+@@ -897,17 +913,20 @@
+         }
+ 
+         void RespawnOrDestroyBasedOnDistance() {
+-            if (hasNpc && lastPositionFromServer) {
++            if (lastPositionFromServer&&(hasNpc||IsCoopPlayer(name))) {
+                 auto dist = (int)(*lastPositionFromServer - player->GetPositionWorld()).LengthApprox();
+ 
+                 if (IsCoopPlayer(name)) {
+                     if (dist > BROADCAST_DISTANCE && isSpawned) {
++                        PlayerNpcs.erase(npc);PlayerNameToNpc.erase(name);
+                         ogame->spawnman->DeleteNpc(npc);
++                        npc=NULL;hasNpc=false;hasModel=false;syncedNpcItems.clear();qaWasDespawned=true;
+                         isSpawned = false;
+                     }
+                     if (dist < BROADCAST_DISTANCE && (!isSpawned || !hasModel)) {
++                        if(qaWasDespawned&&SharedGameplay::Fault("render"))return;
+                         InitCoopFriendNpc();
+-                        isSpawned = true;
++                        UpdateHasNpcAndHasModel();
+                     }
+                 }
+                 else if (dist > BROADCAST_DISTANCE * 1.5) {
+@@ -934,4 +953,5 @@
+             return false;
+         }
+     };
+-}
+\ No newline at end of file
++}
++
 diff --git a/Server.cpp b/Server.cpp
-index 6e423ca..482298d 100644
 --- a/Server.cpp
 +++ b/Server.cpp
-@@ -10,7 +10,7 @@ namespace GOTHIC_ENGINE {
+@@ -10,7 +10,7 @@
  
          ENetAddress address;
          ENetHost* server;
@@ -69,22 +673,449 @@ index 6e423ca..482298d 100644
          address.port = ConnectionPort;
          server = enet_host_create(&address, 32, 2, 0, 0);
          if (server == NULL)
-@@ -67,4 +67,4 @@ namespace GOTHIC_ENGINE {
+@@ -67,4 +67,4 @@
              }
          }
      }
 -}
 \ No newline at end of file
 +}
+diff --git a/SharedGameplay.cpp b/SharedGameplay.cpp
+new file mode 100644
+--- /dev/null
++++ b/SharedGameplay.cpp
+@@ -0,0 +1,202 @@
++// SPDX-License-Identifier: AGPL-3.0-or-later
++// Host-authorized rewards and dialogue leases. Quest coverage is explicitly bounded.
++namespace GOTHIC_ENGINE { namespace SharedGameplay {
++    constexpr int TYPE=1000;
++    bool Fault(const char* name){char role[64]={0},fault[64]={0};GetEnvironmentVariableA("G2_COOP_QA",role,sizeof role);if(strcmp(role,"party-host")&&strcmp(role,"party-client"))return false;GetEnvironmentVariableA("G2_COOP_QA_FAULT",fault,sizeof fault);return !strcmp(name,fault);}
++    static bool qaAllowDialogue=false;
++    static unsigned long long sourceEvent=0;
++    static DWORD lastLeaseAck=0;
++    static bool qaPauseLease=false;
++    static bool applyingXP=false,startingDialogue=false,ready=false,started=false,commitSent=false,dialogueStarted=false;
++    static unsigned long long revision=0,xpSequence=0,lastXP=0,lease=0,leaseRevision=0,requestCounter=0,pendingRequest=0,awardOrdinal=0;
++    static std::string epoch,owner,pendingNpc;
++    static DWORD heartbeat=0,leaseHeard=0,nextPoll=0,pendingSince=0;
++    static std::set<std::string> rewards,sharedNames;
++    static std::map<int,std::string> functionNames;
++    static std::vector<int> scriptContext;
++    static json baseline,candidatesBefore;
++    static json lastGrant;
++    struct PendingCombat {std::string victim,source;int amount;DWORD expires;};
++    static std::map<std::string,PendingCombat> pendingCombat;
++    static std::ofstream Trace(){char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);return std::ofstream(std::filesystem::path(exe).parent_path()/"SharedGameplay.log",std::ios::app);}
++    static std::string Me(){return ServerThread?"HOST":std::string(MyselfId.ToChar());}
++    static std::string Utf8(const zSTRING& s){const char* p=s.ToChar();int n=MultiByteToWideChar(CP_ACP,0,p,-1,nullptr,0);if(!n)return {};std::vector<wchar_t>w(n);MultiByteToWideChar(CP_ACP,0,p,-1,w.data(),n);n=WideCharToMultiByte(CP_UTF8,0,w.data(),-1,nullptr,0,nullptr,nullptr);std::string out(n,0);WideCharToMultiByte(CP_UTF8,0,w.data(),-1,&out[0],n,nullptr,nullptr);out.pop_back();return out;}
++    static zSTRING Native(const std::string& s){int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.c_str(),-1,nullptr,0);if(!n)throw std::runtime_error("Invalid journal UTF8");std::vector<wchar_t>w(n);MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,w.data(),n);n=WideCharToMultiByte(CP_ACP,0,w.data(),-1,nullptr,0,nullptr,nullptr);std::string out(n,0);WideCharToMultiByte(CP_ACP,0,w.data(),-1,&out[0],n,nullptr,nullptr);return zSTRING(out.c_str());}
++    static bool Prefix(const std::string& s,const char* p){return s.rfind(p,0)==0;}
++    static bool Candidate(zCPar_Symbol* s){if(!s||s->type!=zPAR_TYPE_INT||s->parent||s->HasFlag(zPAR_FLAG_CONST|zPAR_FLAG_CLASSVAR|zPAR_FLAG_EXTERNAL))return false;std::string n=s->name.ToChar();if(n.find('.')!=std::string::npos||n.find("_EQUIPPED")!=std::string::npos||n.find("_MERKE_")!=std::string::npos)return false;return !Prefix(n,"PLAYER_TALENT_")&&!Prefix(n,"XP_")&&n!="WISPSKILL_LEVEL"&&n!="HERO_HACKCHANCE"&&s->ele>0&&s->ele<=64;}
++    static bool Core(const std::string& n){return Prefix(n,"MIS_")||Prefix(n,"DIA_")||Prefix(n,"TOPIC_END_")||Prefix(n,"SC_KNOWS")||Prefix(n,"SCKNOWS")||Prefix(n,"KNOWS_")||Prefix(n,"PLAYERTALKEDTO")||Prefix(n,"PLAYER_HASTALKEDTO")||n=="KAPITEL"||n=="RAVENISDEAD"||n=="ENTERED_ADDONWORLD"||n=="HAGEN_BRINGPROOF"||n=="FERNANDO_IMKNAST"||n=="MISSINGPEOPLERETURNEDHOME"||n=="GRITTAXP_ONCE"||n=="ROD_SCHWERTXPGIVEN"||n=="DRACHENEIER_ANGEBOTENXP_ONETIME";}
++    static json Globals(bool all=false){json g=json::object();for(int i=0;i<parser->symtab.table.GetNum();++i){auto s=parser->symtab.table[i];if(!Candidate(s))continue;std::string n=s->name.ToChar();if(!all&&!Core(n)&&!sharedNames.count(n))continue;json values=json::array();for(unsigned k=0;k<s->ele;++k){int v;s->GetValue(v,k);values.push_back(v);}g[n]=values;}return g;}
++    static json Journal(){json topics=json::array();for(auto n=oCLogManager::GetLogManager().m_lstTopics.next;n;n=n->next){auto t=n->data;if(!t)continue;json entries=json::array();for(auto e=t->m_lstEntries.next;e;e=e->next)if(e->data)entries.push_back(Utf8(e->data->m_strDescription));topics.push_back({{"title",Utf8(t->m_strDescription)},{"section",int(t->m_enuSection)},{"status",int(t->m_enuStatus)},{"entries",entries}});}return topics;}
++    static json Told(){json result=json::array();if(ogame->infoman)for(auto n=ogame->infoman->infoList.next;n;n=n->next)if(n->data&&!n->data->pd.permanent&&n->data->WasTold())result.push_back(n->data->instance);return result;}
++    static json State(){return {{"globals",Globals()},{"journal",Journal()},{"told",Told()}};}
++    static void Apply(const json& state,bool dynamic=false){
++        // Validate the complete message before changing any live engine object.
++        if(!state.is_object())throw std::runtime_error("Invalid quest state");
++        if(state.contains("globals")){
++            const auto& g=state.at("globals");if(!g.is_object()||g.size()>2200)throw std::runtime_error("Invalid globals");
++            for(auto& p:g.items()){auto symbol=parser->GetSymbol(p.key().c_str());if(!Candidate(symbol)||(!dynamic&&!Core(p.key())&&!sharedNames.count(p.key()))||!p.value().is_array()||p.value().size()!=symbol->ele)throw std::runtime_error("Unsafe global");for(const auto& v:p.value())v.get<int>();}
++        }
++        if(state.contains("journal")){
++            const auto& topics=state.at("journal");if(!topics.is_array()||topics.size()>500)throw std::runtime_error("Invalid journal");
++            for(const auto& t:topics){auto title=t.at("title").get<std::string>();if(title.size()>4096)throw std::runtime_error("Long title");Native(title);int section=t.at("section").get<int>(),status=t.at("status").get<int>();if(section<0||section>2||status<0||status>4)throw std::runtime_error("Invalid status");const auto& entries=t.at("entries");if(!entries.is_array()||entries.size()>500)throw std::runtime_error("Invalid entries");for(const auto& e:entries){auto text=e.get<std::string>();if(text.size()>65536)throw std::runtime_error("Long entry");Native(text);}}
++        }
++        if(state.contains("told")){const auto& told=state.at("told");if(!told.is_array()||told.size()>10000)throw std::runtime_error("Invalid knowledge");for(const auto& v:told){auto known=ogame->infoman->GetInformation(v.get<int>());if(!known||known->pd.permanent)throw std::runtime_error("Invalid information instance");}}
++
++        if(state.contains("globals")){if(!state["globals"].is_object()||state["globals"].size()>2200)throw std::runtime_error("Invalid quest globals");for(auto& p:state["globals"].items()){auto s=parser->GetSymbol(p.key().c_str());if(!Candidate(s)||(!dynamic&&!Core(p.key())&&!sharedNames.count(p.key()))||!p.value().is_array()||p.value().size()!=s->ele)throw std::runtime_error("Unsafe quest symbol");if(dynamic)sharedNames.insert(p.key());for(unsigned i=0;i<s->ele;++i)s->SetValue(p.value()[i].get<int>(),i);}}
++        if(state.contains("journal")){if(!state["journal"].is_array()||state["journal"].size()>500)throw std::runtime_error("Invalid journal");auto& list=oCLogManager::GetLogManager().m_lstTopics;for(auto& t:state["journal"]){auto title=Native(t.at("title").get<std::string>());oCLogTopic* topic=nullptr;for(auto n=list.next;n;n=n->next)if(n->data&&n->data->m_strDescription==title){topic=n->data;break;}if(!topic){topic=new oCLogTopic();topic->m_strDescription=title;list.Insert(topic);}int section=t.at("section"),status=t.at("status");if(section<0||section>2||status<0||status>4)throw std::runtime_error("Invalid quest status");topic->m_enuSection=(oCLogTopic::zELogSection)section;topic->m_enuStatus=(oCLogTopic::zELogTopicStatus)status;auto entries=t.at("entries");if(!entries.is_array()||entries.size()>500)throw std::runtime_error("Invalid journal entries");for(auto e=entries.rbegin();e!=entries.rend();++e){auto text=Native(e->get<std::string>());bool found=false;for(auto n=topic->m_lstEntries.next;n;n=n->next)if(n->data&&n->data->m_strDescription==text){found=true;break;}if(!found)topic->AddEntry(text);}}}
++        if(state.contains("told")){if(!state["told"].is_array()||state["told"].size()>10000)throw std::runtime_error("Invalid dialogue knowledge");for(auto& v:state["told"]){auto info=ogame->infoman->GetInformation(v.get<int>());if(info&&!info->pd.permanent)info->SetTold(1);}}
++    }
++    static void Send(json j){j["type"]=TYPE;j["id"]=Me();ReadyToSendJsons.enqueue(j);}
++    static void Publish(){++revision;baseline=State();Send({{"kind","state"},{"epoch",epoch},{"rev",revision},{"xpseq",xpSequence},{"state",baseline},{"owner",owner},{"lease",lease}});}
++    static std::string NpcKey(oCNpc* npc){if(!npc)return {};auto i=NpcToUniqueNameList.find(npc);return i!=NpcToUniqueNameList.end()?std::string(i->second.ToChar()):std::string(npc->GetInstanceName().ToChar());}
++    static std::string CombatKey(oCNpc* npc){return "combat:"+std::string(ogame->GetGameWorld()->worldName.ToChar())+":"+NpcKey(npc);}
++    static void StopDialogue(){auto& info=oCInformationManager::GetInformationManager();if(!info.HasFinished()||info.WaitingForEnd()){info.Exit();info.OnTermination();}dialogueStarted=false;commitSent=false;pendingRequest=0;pendingNpc.clear();}
++    static oCNpc* Resolve(const std::string& key){auto n=UniqueNameToNpcList.find(key.c_str());if(n!=UniqueNameToNpcList.end())return n->second;for(auto p=ogame->GetGameWorld()->voblist_npcs->next;p;p=p->next)if(p->data&&key==p->data->GetInstanceName().ToChar())return p->data;return nullptr;}
++    static void Release(){owner.clear();commitSent=false;dialogueStarted=false;pendingRequest=0;pendingNpc.clear();Publish();}
++    static bool Acquire(const std::string& who,const std::string& npc,unsigned long long request){if(!owner.empty()||!Resolve(npc))return false;owner=who;++lease;leaseRevision=revision;leaseHeard=GetTickCount();awardOrdinal=0;candidatesBefore=Globals(true);Send({{"kind","grant"},{"epoch",epoch},{"owner",owner},{"lease",lease},{"request",request},{"npc",npc},{"rev",leaseRevision},{"state",State()}});return true;}
++    static json Changes(){json changed=json::object();auto now=Globals(true);for(auto& p:now.items())if(candidatesBefore.contains(p.key())&&candidatesBefore[p.key()]!=p.value())changed[p.key()]=p.value();auto state=State();state["globals"]=changed;return state;}
++    static CInvoke<void(__fastcall*)(oCInformationManager*,oCNpc*)>* infoHook=nullptr;
++    static void __fastcall GateInfo(oCInformationManager* info,oCNpc* npc);
++    static CInvoke<void(__fastcall*)(oCInformationManager*,oCNpc*)> OriginalInfo(0x006609F0,&GateInfo);
++    static void __fastcall GateInfo(oCInformationManager* info,oCNpc* npc){
++        if((QaRole("party-host")||QaRole("party-client"))&&!qaAllowDialogue)return;
++        if(!npc||(!ServerThread&&!ClientThread)||startingDialogue){OriginalInfo(info,npc);return;}
++        if(!started){OriginalInfo(info,npc);return;}
++        if(owner==Me()){if(commitSent)return;dialogueStarted=true;OriginalInfo(info,npc);return;}
++        if(!owner.empty()&&Fault("dialogue")){OriginalInfo(info,npc);return;}
++        if(!owner.empty()){ChatLog("Another player is talking. Wait until the dialogue finishes.");return;}
++        if(ServerThread){if(Acquire("HOST",NpcKey(npc),0)){dialogueStarted=true;OriginalInfo(info,npc);}return;}
++        if(!pendingRequest){pendingRequest=++requestCounter;pendingNpc=NpcKey(npc);pendingSince=GetTickCount();Send({{"kind","request"},{"request",pendingRequest},{"npc",pendingNpc}});}
++    }
++    static void ApplyXP(int amount){if(amount<=0)return;auto previous=applyingXP;applyingXP=true;int function=parser->GetIndex("B_GIVEPLAYERXP");parser->CallFunc(function,amount);applyingXP=previous;}
++    static void Grant(const std::string& key,int amount){if(amount<=0||amount>10000000||rewards.count(key))return;rewards.insert(key);ApplyXP(amount);++xpSequence;lastGrant={{"kind","xp"},{"epoch",epoch},{"seq",xpSequence},{"amount",amount},{"key",key}};if(!Fault("xp"))Send(lastGrant);Trace()<<"grant "<<xpSequence<<" "<<key<<" "<<amount<<"\n";}
++    static void __fastcall StackHook(zCParser*,void*,int);
++    static CInvoke<void(__thiscall*)(zCParser*,int)> OriginalStack(0x00791960,&StackHook);
++    static void __fastcall StackHook(zCParser* p,void*,int position){
++        if(p!=parser||(!ServerThread&&!ClientThread)||!started||applyingXP){OriginalStack(p,position);return;}
++        auto symbol=parser->GetSymbol("B_GIVEPLAYERXP");int xp=-1;if(symbol)symbol->GetStackPos(xp,0);
++        if(position!=xp){scriptContext.push_back(position);OriginalStack(p,position);scriptContext.pop_back();return;}
++        int amount=p->PopDataValue();if(amount<=0)return;
++        std::string context=scriptContext.empty()?"external":functionNames[scriptContext.back()];
++        auto selfSymbol=parser->GetSymbol("SELF");auto actor=selfSymbol?(oCNpc*)selfSymbol->GetInstanceAdr():nullptr;
++        bool combat=(context=="ZS_DEAD"||context=="ZS_UNCONSCIOUS")&&actor&&actor!=player&&(actor->IsDead()||actor->IsUnconscious());
++        Trace()<<"native XP context="<<context<<" amount="<<amount<<" combat="<<combat<<"\n";
++        std::string key;
++        if(combat)key=CombatKey(actor);
++        else if(owner==Me())key="dialogue:"+epoch+":"+std::to_string(lease)+":"+std::to_string(++awardOrdinal);
++        else key="event:"+epoch+":"+Me()+":"+std::to_string(++sourceEvent);
++        if(ServerThread){if(!combat&&!owner.empty()&&owner!="HOST")return;Grant(key,amount);}
++        else {Trace()<<"request "<<key<<" "<<amount<<"\n";Send({{"kind","xp_request"},{"key",key},{"amount",amount},{"combat",combat},{"victim",combat?NpcKey(actor):""},{"lease",lease}});}
++    }
++    bool Control(const json& e){return e.value("type",-1)==TYPE;}
++    void PeerLeft(const std::string& id){if(ServerThread&&owner==id)Release();for(auto it=pendingCombat.begin();it!=pendingCombat.end();)if(it->second.source==id)it=pendingCombat.erase(it);else ++it;}
++    void Packet(const json& e,ENetEvent){
++        if(!player||IsLoadingLevel)return;
++        try{
++            auto kind=e.at("kind").get<std::string>();auto from=e.at("id").get<std::string>();
++            if(ServerThread){
++                if(kind=="hello"){Send({{"kind","state"},{"to",from},{"epoch",epoch},{"rev",revision},{"xpseq",xpSequence},{"state",State()},{"owner",owner},{"lease",lease}});return;}
++                if(kind=="request"){if(!Acquire(from,e.at("npc"),e.at("request")))Send({{"kind","denied"},{"to",from},{"request",e.at("request")}});return;}
++                if(kind=="keep"&&owner==from&&e.at("lease")==lease){leaseHeard=GetTickCount();Send({{"kind","keep_ack"},{"to",from},{"lease",lease}});return;}
++                if(kind=="commit"&&owner==from&&e.at("lease")==lease&&e.at("rev")==leaseRevision){if(!Fault("quest"))Apply(e.at("state"),true);Release();return;}
++                if(kind=="delta"&&owner.empty()&&e.at("rev")==revision){Apply(e.at("state"));Publish();return;}
++                if(kind=="xp_request"){
++                    std::string key=e.at("key");if(key.size()>512)return;bool combat=e.value("combat",false);
++                    if(combat){auto victim=Resolve(e.at("victim"));int amount=e.at("amount");if(!victim||key!=CombatKey(victim)||amount<=0||amount>10000000)return;
++                        if(!victim->IsDead()&&!victim->IsUnconscious()&&victim->GetAttribute(NPC_ATR_HITPOINTS)>0){if(pendingCombat.size()<64)pendingCombat[key]={e.at("victim"),from,amount,GetTickCount()+5000};return;}}
++                    else if(Prefix(key,"dialogue:")){if(owner!=from||e.at("lease")!=lease)return;}
++                    else if(!Prefix(key,("event:"+epoch+":"+from+":").c_str())||(!owner.empty()&&owner!=from))return;
++                    Grant(key,e.at("amount"));return;
++                }
++                return;
++            }
++            if(from!="HOST")return;
++            if(e.contains("to")&&e.at("to")!=Me())return;
++            if(kind=="keep_ack"&&owner==Me()&&e.at("lease")==lease){lastLeaseAck=GetTickCount();return;}
++            if(kind=="state"){
++                if(owner==Me()&&(e.at("owner")!=Me()||e.at("lease")!=lease))StopDialogue();
++                bool newEpoch=epoch!=e.at("epoch");epoch=e.at("epoch");revision=e.at("rev");if(newEpoch)lastXP=e.at("xpseq");
++                Apply(e.at("state"),true);baseline=State();owner=e.at("owner");lease=e.at("lease");ready=true;
++                if(owner.empty()){commitSent=false;dialogueStarted=false;pendingRequest=0;pendingNpc.clear();}return;
++            }
++            if(kind=="grant"){
++                if(owner==Me()&&(e.at("owner")!=Me()||e.at("lease")!=lease))StopDialogue();
++                owner=e.at("owner");lease=e.at("lease");lastLeaseAck=GetTickCount();if(owner!=Me())return;
++                if(!pendingRequest||pendingRequest!=e.at("request")||GetTickCount()-pendingSince>10000){Send({{"kind","commit"},{"lease",lease},{"rev",e.at("rev")},{"state",e.at("state")}});return;}
++                epoch=e.at("epoch");revision=e.at("rev");Apply(e.at("state"),true);baseline=State();candidatesBefore=Globals(true);awardOrdinal=0;
++                auto npc=Resolve(pendingNpc);if(npc){startingDialogue=true;dialogueStarted=true;OriginalInfo(&oCInformationManager::GetInformationManager(),npc);startingDialogue=false;}return;
++            }
++            if(kind=="denied"&&e.at("to")==Me()&&e.at("request")==pendingRequest){pendingRequest=0;pendingNpc.clear();ChatLog("Another player is talking. Try again after the dialogue.");return;}
++            if(kind=="xp"&&ready&&e.at("epoch")==epoch){auto sequence=e.at("seq").get<unsigned long long>();if(sequence<=lastXP)return;lastXP=sequence;ApplyXP(e.at("amount"));return;}
++        }catch(const std::exception& ex){Trace()<<"Rejected control: "<<ex.what()<<"\n";}
++    }
++    void Tick(){
++        if(!player||!ogame||!ogame->GetWorld()||IsLoadingLevel||(!ServerThread&&!ClientThread))return;
++        if(!started){started=true;epoch=ServerThread?std::to_string(GetTickCount64())+"-"+std::to_string(GetCurrentProcessId()):"";ready=ServerThread!=nullptr;owner.clear();baseline=State();for(int i=0;i<parser->symtab.table.GetNum();++i){auto s=parser->symtab.table[i];if(s&&s->type==zPAR_TYPE_FUNC){int pos;s->GetStackPos(pos,0);functionNames[pos]=s->name.ToChar();}}if(ServerThread)Publish();else Send({{"kind","hello"}});}
++        auto now=GetTickCount();
++        if(ServerThread)for(auto it=pendingCombat.begin();it!=pendingCombat.end();){auto victim=Resolve(it->second.victim);if(victim&&(victim->IsDead()||victim->IsUnconscious()||victim->GetAttribute(NPC_ATR_HITPOINTS)<=0)){Grant(it->first,it->second.amount);it=pendingCombat.erase(it);}else if((LONG)(now-it->second.expires)>=0)it=pendingCombat.erase(it);else ++it;}
++        if(ClientThread&&owner==Me()&&now-lastLeaseAck>8000){StopDialogue();owner="LEASE_EXPIRED";}auto& info=oCInformationManager::GetInformationManager();
++        if(owner==Me()&&dialogueStarted){
++            if(info.HasFinished()&&!info.WaitingForEnd()&&!commitSent){commitSent=true;auto state=Changes();if(ServerThread){for(auto& p:state["globals"].items())sharedNames.insert(p.key());Release();}else Send({{"kind","commit"},{"lease",lease},{"rev",revision},{"state",state}});}
++            else if(ClientThread&&!qaPauseLease&&now-heartbeat>1000){heartbeat=now;Send({{"kind","keep"},{"lease",lease}});}
++        }
++        if(ServerThread&&!owner.empty()&&owner!="HOST"&&now-leaseHeard>15000)Release();
++        if(ClientThread&&pendingRequest&&owner!=Me()&&now-pendingSince>10000){pendingRequest=0;pendingNpc.clear();}
++        if(now<nextPoll||!ready||!owner.empty())return;nextPoll=now+500;
++        auto current=State();if(current!=baseline){if(ServerThread)Publish();else {json g=json::object();for(auto& p:current["globals"].items())if(baseline["globals"].contains(p.key())&&p.value()!=baseline["globals"][p.key()])g[p.key()]=p.value();current["globals"]=g;Send({{"kind","delta"},{"rev",revision},{"state",current}});baseline=State();}}
++    }
++    void Save(const std::filesystem::path& directory){std::filesystem::create_directories(directory);std::ofstream out(directory/"COOPGAME.SAV");out<<json({{"rewards",rewards},{"names",sharedNames},{"sequence",xpSequence}}).dump();}
++    void Load(const std::filesystem::path& directory){started=false;ready=false;pendingCombat.clear();owner.clear();pendingRequest=0;dialogueStarted=false;commitSent=false;rewards.clear();sharedNames.clear();xpSequence=0;std::ifstream in(directory/"COOPGAME.SAV");if(in){json state;in>>state;rewards=state.value("rewards",std::set<std::string>());sharedNames=state.value("names",std::set<std::string>());xpSequence=state.value("sequence",0ULL);}}
++    bool CanSave(){return owner.empty();}
++    static json QaState(){
++        auto& info=oCInformationManager::GetInformationManager();json npcs=json::array();
++        for(auto& p:SyncNpcs){auto r=p.second;if(!r||!IsCoopPlayer(p.first))continue;auto n=r->npc;json v={{"name",string(p.first).ToChar()},{"npc",n!=nullptr},{"model",n&&n->GetModel()!=nullptr},{"leaf",n?n->vobLeafList.GetNum():0},{"world",n&&n->GetHomeWorld()==ogame->GetWorld()},{"visible",n?int(n->showVisual):0}};npcs.push_back(v);}
++        return {{"ready",ready},{"xp",player->experience_points},{"next",player->experience_points_next_level},{"level",player->level},{"lp",player->learn_points},{"owner",owner},{"lease",lease},{"finished",info.HasFinished()!=0},{"waiting",info.WaitingForEnd()!=0},{"core_count",Globals().size()},{"quest",State()},{"puppets",npcs}};
++    }
++    void QaTick(){
++        if(!QaRole("party-host")&&!QaRole("party-client"))return;
++        if(!player||!ogame||!ogame->GetWorld()||IsLoadingLevel)return;
++        char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);auto system=std::filesystem::path(exe).parent_path();
++        auto& info=oCInformationManager::GetInformationManager();
++        if(!ServerThread&&!ClientThread&&(!info.HasFinished()||info.WaitingForEnd())){info.Exit();info.OnTermination();return;}
++        static DWORD next=0;if(GetTickCount()>=next){next=GetTickCount()+250;std::ofstream out(system/"PartyQA.state");out<<QaState().dump();}
++        auto path=system/"PartyQA.command";if(!std::filesystem::exists(path))return;
++        json reply;
++        try{
++            json cmd;{std::ifstream in(path);in>>cmd;}std::filesystem::remove(path);reply={{"id",cmd.at("id")},{"ok",true}};std::string op=cmd.at("op");
++            if(op=="start"){
++                if(ServerThread||ClientThread)throw std::runtime_error("Already started");
++                auto thread=new Thread();if(QaRole("party-host")){MyselfId="HOST";thread->Init(&CoopServerThread);thread->Detach();ServerThread=thread;}else{addSyncedNpc("HOST");thread->Init(&CoopClientThread);thread->Detach();ClientThread=thread;}
++            }else if(op=="xp"){int amount=cmd.at("amount");parser->CallFunc(parser->GetIndex("B_GIVEPLAYERXP"),amount);}
++            else if(op=="repeat-xp"){if(lastGrant.is_null())throw std::runtime_error("No award");Send(lastGrant);Send(lastGrant);}
++            else if(op=="near-level"){player->experience_points=player->experience_points_next_level-10;}
++            else if(op=="dialogue"){auto npc=Resolve(cmd.at("npc"));if(!npc)throw std::runtime_error("NPC missing");qaAllowDialogue=true;GateInfo(&info,npc);qaAllowDialogue=false;}
++            else if(op=="lease-pause"){qaPauseLease=true;}
++            else if(op=="reject-invalid"){
++                auto original=State();auto invalid=original;invalid["globals"]["KAPITEL"]=json::array({99});invalid["journal"]=json::array({{{"title","Invalid QA topic"},{"section",99},{"status",0},{"entries",json::array()}}});bool rejected=false;try{Apply(invalid,true);}catch(...){rejected=true;}if(!rejected||State()!=original)throw std::runtime_error("Rejected state mutated engine");
++            }
++            else if(op=="prepare-victim"){
++                oCNpc* victim=nullptr;std::string key;for(auto& n:UniqueNameToNpcList){auto v=n.second;if(v&&v!=player&&!v->IsDead()&&std::string(string(n.first).ToChar())!=cmd.value("exclude",std::string())&&std::string(v->GetInstanceName().ToChar()).find("SCAVENGER")!=std::string::npos){victim=v;key=string(n.first).ToChar();break;}}
++                if(!victim)throw std::runtime_error("No living scavenger");auto position=player->GetPositionWorld()+zVEC3(150,0,0);victim->Enable(position);reply["victim"]=key;
++            }
++            else if(op=="kill"){auto victim=Resolve(cmd.at("npc"));if(!victim)throw std::runtime_error("Missing victim");victim->SetAttribute(NPC_ATR_HITPOINTS,1);victim->OnDamage(victim,player,100000,4,victim->GetPositionWorld());reply["dead"]=victim->IsDead()!=0;}
++            else if(op=="finish"){info.Exit();info.OnTermination();}
++            else if(op=="real-quest"){
++                if(owner!=Me())throw std::runtime_error("No dialogue lease");auto npc=Resolve("BAU_950_LOBART");if(!npc)throw std::runtime_error("Missing Lobart");parser->SetInstance("SELF",npc);parser->SetInstance("OTHER",player);int action=parser->GetIndex("DIA_LOBART_WORKNOW_OK");if(action<0)throw std::runtime_error("Missing real quest action");parser->CallFunc(action);
++            }
++            else if(op=="quest"){
++                auto s=parser->GetSymbol("MIS_LOBART_RUEBEN");if(!s)throw std::runtime_error("Quest symbol missing");s->SetValue(cmd.value("value",1),0);
++                auto title=Native("QA: shared Lobart quest");auto& list=oCLogManager::GetLogManager().m_lstTopics;auto topic=new oCLogTopic();topic->m_strDescription=title;topic->m_enuSection=oCLogTopic::zELogSection_Missions;topic->m_enuStatus=oCLogTopic::zELogTopicStatus_Running;topic->AddEntry(Native("Shared entry: accepted by the dialogue owner."));list.Insert(topic);
++                auto instance=parser->GetIndex("DIA_LOBART_RUEBENRUNNING");if(instance>=0){auto known=ogame->infoman->GetInformation(instance);if(known)known->SetTold(1);}
++            }else if(op=="puppet-cycle"){
++                RemoteNpc* r=nullptr;for(auto& p:SyncNpcs)if(IsCoopPlayer(p.first)&&p.second&&p.second->npc&&p.second->lastPositionFromServer){r=p.second;break;}if(!r)throw std::runtime_error("No initialized puppet");auto original=*r->lastPositionFromServer;auto count=PlayerNpcs.size();
++                for(int i=0;i<3;++i){*r->lastPositionFromServer=player->GetPositionWorld()+zVEC3(10000,0,0);r->RespawnOrDestroyBasedOnDistance();if(r->npc||r->hasNpc)throw std::runtime_error("Distant puppet left dangling pointer");int armor=parser->GetIndex("ITAR_MIL_L");if(armor>0)r->UpdateArmor({{"armor","ITAR_MIL_L"}});*r->lastPositionFromServer=original;r->RespawnOrDestroyBasedOnDistance();r->UpdateHasNpcAndHasModel();if(!r->npc||!r->hasModel||r->npc->GetHomeWorld()!=ogame->GetWorld()||PlayerNpcs.size()!=count)throw std::runtime_error("Puppet failed to respawn");if(armor>0&&(!r->npc->GetEquippedArmor()||r->npc->GetEquippedArmor()->GetInstance()!=armor))throw std::runtime_error("Gear lost while despawned");}
++                reply["cycles"]=3;
++            }else if(op=="save-ledger"){Save(system/"PartyQA-ledger");reply["rewards"]=rewards.size();}
++            else throw std::runtime_error("Unknown QA operation");
++            reply["state"]=QaState();
++        }catch(const std::exception& e){reply["ok"]=false;reply["error"]=e.what();}
++        std::ofstream out(system/"PartyQA.reply");out<<reply.dump();
++    }
++} }
++
+diff --git a/SharedGameplay.h b/SharedGameplay.h
+new file mode 100644
+--- /dev/null
++++ b/SharedGameplay.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: AGPL-3.0-or-later
++namespace GOTHIC_ENGINE { namespace SharedGameplay {
++    bool Control(const json&);
++    void Packet(const json&,ENetEvent);
++    void Tick();
++    void PeerLeft(const std::string&);
++    void Save(const std::filesystem::path&);
++    void Load(const std::filesystem::path&);
++    void QaTick();
++    bool CanSave();
++    bool Fault(const char*);
++} }
+diff --git a/Sources.h b/Sources.h
+--- a/Sources.h
++++ b/Sources.h
+@@ -9,6 +9,7 @@
+ #include "Utils.cpp"
+ #include "Global.cpp"
+ #include "Helpers.cpp"
++#include "SharedGameplay.h"
+ #include "Debugger.cpp"
+ #include "PlayerAnimation.cpp"
+ #include "LocalNpc.cpp"
+@@ -24,8 +25,12 @@
+ #include "SpellCastProcessor.cpp"
+ #include "ReviveFriendLoop.cpp"
+ #include "Hooks.cpp"
++#include "SteamOverlay.cpp"
++namespace GOTHIC_ENGINE { namespace HostSaves { static bool CanConnect(); } }
+ #include "Plugin.cpp"
++#include "SharedGameplay.cpp"
++#include "HostSaves.cpp"
+ #include "UnionHooks.cpp"
+ #pragma endregion
+ 
+-// ...
+\ No newline at end of file
++// ...
+diff --git a/SteamOverlay.cpp b/SteamOverlay.cpp
+new file mode 100644
+--- /dev/null
++++ b/SteamOverlay.cpp
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: AGPL-3.0-or-later
++// Optional in-game Steam integration. Only enabled by our Steam launcher.
++namespace GOTHIC_ENGINE {
++    namespace CoopSteam {
++        struct Callback { int user, id; unsigned char* data; int size; };
++        static bool ready=false, keyDown=false;
++        static int pipe=0, lastEnabled=-1;
++        static char logPath[MAX_PATH]={0};
++        static unsigned long long lobby=0;
++        static unsigned long long requestedLobby=0;
++        static char requestPath[MAX_PATH]={0}, readyPath[MAX_PATH]={0};
++        static bool connectPending=false;
++        static void* friends=nullptr;
++        static void* utils=nullptr;
++        static void (__cdecl* shutdown)();
++        static void (__cdecl* runFrame)(int);
++        static bool (__cdecl* nextCallback)(int,Callback*);
++        static void (__cdecl* freeCallback)(int);
++        static bool (__cdecl* overlayEnabled)(void*);
++        static void (__cdecl* activate)(void*,const char*);
++        static void (__cdecl* invite)(void*,unsigned long long);
++        static void Log(const char* message) {
++            if(!logPath[0])return;
++            FILE* file=fopen(logPath,"a");
++            if(file){fprintf(file,"%lu %s\n",GetTickCount(),message);fclose(file);}
++        }
++        static void RequestJoin(unsigned long long target) {
++            if(!target || requestedLobby==target || lobby==target)return;
++            if(!requestPath[0] || ServerThread || ClientThread) {
++                Log("Join rejected: start Steam-Overlay.cmd for a fresh session");
++                ChatLog("Steam join: start Steam-Overlay.cmd before joining a new session.");
++                return;
++            }
++            char temporary[MAX_PATH+8];snprintf(temporary,sizeof(temporary),"%s.tmp",requestPath);
++            FILE* file=fopen(temporary,"w");if(!file){Log("Cannot write join request");return;}
++            fprintf(file,"%llu\n",target);fclose(file);
++            if(!MoveFileExA(temporary,requestPath,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){Log("Cannot submit join request");return;}
++            requestedLobby=target;Log("Overlay join request forwarded to Steam relay");
++        }
++        static void PollJoin() {
++            if(!requestedLobby || !readyPath[0])return;
++            FILE* file=fopen(readyPath,"r");if(!file)return;
++            int port=0;unsigned long long target=0;
++            int fields=fscanf(file,"%d %llu",&port,&target);fclose(file);
++            if(fields!=2 || port<1 || port>65535 || target!=requestedLobby)return;
++            DeleteFileA(readyPath);
++            if(ServerThread || ClientThread){Log("Join cancelled: game networking already started");return;}
++            ConnectionPort=port;CoopConfig["server"]="127.0.0.1";CoopConfig["port"]=port;
++            lobby=target;connectPending=true;requestedLobby=0;
++            Log("Overlay join accepted; will connect when a world is loaded and dialogue ends");
++            ChatLog("Steam lobby joined. Load the same world as the host; connection starts automatically.");
++        }
++        static void Init() {
++            char enabled[8]={0};
++            if(!GetEnvironmentVariableA("G2_COOP_STEAM_OVERLAY",enabled,sizeof(enabled)) || strcmp(enabled,"1"))return;
++            char system[MAX_PATH],path[MAX_PATH];
++            DWORD length=GetModuleFileNameA(NULL,system,sizeof(system));
++            if(!length || length>=sizeof(system))return;
++            char* slash=strrchr(system,'\\');if(!slash)return;*slash=0;
++            if(snprintf(logPath,sizeof(logPath),"%s\\GothicCoopSteamOverlay.log",system)>=sizeof(logPath))return;
++            snprintf(path,sizeof(path),"%s\\..\\SteamLink\\steam_api.dll",system);
++            Log("initializing Steam inside Gothic2.exe");
++            HMODULE api=LoadLibraryExA(path,NULL,LOAD_WITH_ALTERED_SEARCH_PATH);
++            if(!api){Log("steam_api.dll load failed; game continues without overlay");return;}
++            auto init=(int(__cdecl*)(char*))GetProcAddress(api,"SteamAPI_InitFlat");
++            auto dispatchInit=(void(__cdecl*)())GetProcAddress(api,"SteamAPI_ManualDispatch_Init");
++            auto getPipe=(int(__cdecl*)())GetProcAddress(api,"SteamAPI_GetHSteamPipe");
++            auto getFriends=(void*(__cdecl*)())GetProcAddress(api,"SteamAPI_SteamFriends_v018");
++            auto getUtils=(void*(__cdecl*)())GetProcAddress(api,"SteamAPI_SteamUtils_v010");
++            shutdown=(void(__cdecl*)())GetProcAddress(api,"SteamAPI_Shutdown");
++            runFrame=(void(__cdecl*)(int))GetProcAddress(api,"SteamAPI_ManualDispatch_RunFrame");
++            nextCallback=(bool(__cdecl*)(int,Callback*))GetProcAddress(api,"SteamAPI_ManualDispatch_GetNextCallback");
++            freeCallback=(void(__cdecl*)(int))GetProcAddress(api,"SteamAPI_ManualDispatch_FreeLastCallback");
++            overlayEnabled=(bool(__cdecl*)(void*))GetProcAddress(api,"SteamAPI_ISteamUtils_IsOverlayEnabled");
++            activate=(void(__cdecl*)(void*,const char*))GetProcAddress(api,"SteamAPI_ISteamFriends_ActivateGameOverlay");
++            invite=(void(__cdecl*)(void*,unsigned long long))GetProcAddress(api,"SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog");
++            if(!init||!dispatchInit||!getPipe||!getFriends||!getUtils||!shutdown||!runFrame||!nextCallback||!freeCallback||!overlayEnabled||!activate||!invite){Log("Steam API exports missing; overlay disabled");return;}
++            char error[1024]={0};
++            int result=init(error);
++            if(result){Log("Steam init failed; game continues without overlay");Log(error);return;}
++            friends=getFriends();utils=getUtils();
++            if(!friends||!utils){Log("Steam interfaces unavailable");shutdown();return;}
++            dispatchInit();pipe=getPipe();
++            char id[32]={0};GetEnvironmentVariableA("G2_COOP_STEAM_LOBBY",id,sizeof(id));
++            lobby=_strtoui64(id,nullptr,10);
++            GetEnvironmentVariableA("G2_COOP_JOIN_REQUEST",requestPath,sizeof(requestPath));
++            GetEnvironmentVariableA("G2_COOP_JOIN_READY",readyPath,sizeof(readyPath));
++            ready=true;Log("Steam init OK; Shift+Tab overlay, F10 invite, Shift+F10 friends");
++        }
++        static void Pump() {
++            if(!ready)return;
++            runFrame(pipe);
++            Callback callback;
++            while(nextCallback(pipe,&callback)) {
++                if(callback.id==331 && callback.size>=1)Log(callback.data[0]?"overlay_active=1":"overlay_active=0");
++                if(callback.id==333 && callback.size>=8) {
++                    unsigned long long target=0;memcpy(&target,callback.data,8);RequestJoin(target);
++                }
++                if(callback.id==337 && callback.size>=9) {
++                    char connect[257]={0};int length=callback.size-8;if(length>256)length=256;
++                    memcpy(connect,callback.data+8,length);
++                    const char* token=strstr(connect,"+connect_lobby ");
++                    if(token)RequestJoin(_strtoui64(token+15,nullptr,10));
++                }
++                freeCallback(pipe);
++            }
++            PollJoin();
++            int enabled=overlayEnabled(utils)?1:0;
++            if(enabled!=lastEnabled){lastEnabled=enabled;Log(enabled?"overlay_enabled=1":"overlay_enabled=0 (waiting for Steam graphics hook)");}
++            DWORD foregroundPid=0;GetWindowThreadProcessId(GetForegroundWindow(),&foregroundPid);
++            bool down=foregroundPid==GetCurrentProcessId() && (GetAsyncKeyState(VK_F10)&0x8000);
++            if(down && !keyDown) {
++                if(!enabled)Log("F10: overlay not ready; check Steam in-game overlay setting");
++                else if(lobby && !(GetAsyncKeyState(VK_SHIFT)&0x8000)){invite(friends,lobby);Log("F10: opened current lobby invite dialog");}
++                else {activate(friends,"Friends");Log("F10: opened friends overlay");}
++            }
++            keyDown=down;
++        }
++        static void Exit() {if(ready){ready=false;shutdown();}}
++    }
++}
+diff --git a/SyncHelpers.cpp b/SyncHelpers.cpp
+--- a/SyncHelpers.cpp
++++ b/SyncHelpers.cpp
+@@ -1,14 +1,16 @@
+ namespace GOTHIC_ENGINE {
+ 	RemoteNpc* addSyncedNpc(string uniqueName) {
++		if(SyncNpcs.count(uniqueName)&&SyncNpcs[uniqueName])return SyncNpcs[uniqueName];
+ 		auto myFriend = new RemoteNpc(uniqueName);
+ 		SyncNpcs[uniqueName] = myFriend;
+ 		return myFriend;
+ 	}
+ 
+ 	void removeSyncedNpc(string uniqueName) {
+-		auto removedNpc = SyncNpcs[uniqueName];
++		auto found=SyncNpcs.find(uniqueName);if(found==SyncNpcs.end()||!found->second)return;
++		auto removedNpc = found->second;
+ 		json j; 
+ 		j["type"] = DESTROY_NPC;
+ 		removedNpc->localUpdates.push_back(j);
+ 	}
+-}
+\ No newline at end of file
++}
 diff --git a/UnionHooks.cpp b/UnionHooks.cpp
-index c9786b6..8436704 100644
 --- a/UnionHooks.cpp
 +++ b/UnionHooks.cpp
-@@ -30,6 +30,14 @@ namespace GOTHIC_ENGINE {
+@@ -4,6 +4,7 @@
+     TSaveLoadGameInfo& SaveLoadGameInfo = UnionCore::SaveLoadGameInfo;
+ 
+     void _Game_Entry() {
++        CoopSteam::Init();
+         Game_Entry();
+     }
+ 
+@@ -12,6 +13,7 @@
+     }
+ 
+     void _Game_Loop() {
++        CoopSteam::Pump();
+         try {
+             Game_Loop();
+         }
+@@ -21,15 +23,27 @@
+     }
+ 
+     void _Game_Exit() {
++        CoopSteam::Exit();
+     }
+ 
+     void _Game_PreLoop() {
+     }
+ 
+     void _Game_PostLoop() {
++        SharedGameplay::QaTick();
++        HostSaves::Tick();
      }
  
      void _Game_MenuLoop() {
-+        if(QaRole("host") || QaRole("client")) {
++        CoopSteam::Pump();
++        if(QaRole("host") || QaRole("client") || QaRole("save") || QaRole("checkpoint") || QaRole("party-host") || QaRole("party-client")) {
 +            static bool started=false;
 +            auto menu=zCMenu::GetActive();
 +            if(!started && menu && menu->GetName()=="MENU_MAIN") {
@@ -95,10 +1126,61 @@ index c9786b6..8436704 100644
      }
  
      void _Game_SaveBegin() {
-@@ -175,4 +183,4 @@ namespace GOTHIC_ENGINE {
+@@ -44,6 +58,7 @@
+     void _Game_SaveEnd() {
+         try {
+             Game_SaveEnd();
++            if(!SaveLoadGameInfo.changeLevel&&SaveLoadGameInfo.slotID>=0)HostSaves::Event("save",SaveLoadGameInfo.slotID);
+         }
+         catch (...) {
+             SaveErrorDetails();
+@@ -74,6 +89,7 @@
+ 
+     void _Game_LoadEnd_NewGame() {
+         _LoadEnd();
++        HostSaves::Event("new",-2);
+     }
+ 
+     void _Game_LoadBegin_SaveGame() {
+@@ -83,6 +99,7 @@
+     void _Game_LoadEnd_SaveGame() {
+         try {
+             Game_LoadEnd_SaveGame();
++            if(SaveLoadGameInfo.slotID>=0)HostSaves::Event("load",SaveLoadGameInfo.slotID);
+         }
+         catch (...) {
+             SaveErrorDetails();
+@@ -175,4 +192,4 @@
          Enabled(AppDefault) _Game_DefineExternals,
          Enabled(AppDefault) _Game_ApplyOptions
      );
 -}
 \ No newline at end of file
 +}
+diff --git a/ZenGin/Gothic_UserAPI/CGameManager.inl b/ZenGin/Gothic_UserAPI/CGameManager.inl
+--- a/ZenGin/Gothic_UserAPI/CGameManager.inl
++++ b/ZenGin/Gothic_UserAPI/CGameManager.inl
+@@ -2,4 +2,6 @@
+ 
+ // User API for CGameManager
+ // Add your methods here
++void Write_Savegame_HostOnly(int);
++void Read_Savegame_HostOnly(int);
+ 
+diff --git a/ZenGin/Gothic_UserAPI/oCSavegameInfo.inl b/ZenGin/Gothic_UserAPI/oCSavegameInfo.inl
+--- a/ZenGin/Gothic_UserAPI/oCSavegameInfo.inl
++++ b/ZenGin/Gothic_UserAPI/oCSavegameInfo.inl
+@@ -3,3 +3,4 @@
+ // User API for oCSavegameInfo
+ // Add your methods here
+ 
++zSTRING GetDir_HostSave();
+diff --git a/ZenGin/Gothic_UserAPI/oCSavegameManager.inl b/ZenGin/Gothic_UserAPI/oCSavegameManager.inl
+--- a/ZenGin/Gothic_UserAPI/oCSavegameManager.inl
++++ b/ZenGin/Gothic_UserAPI/oCSavegameManager.inl
+@@ -3,3 +3,5 @@
+ // User API for oCSavegameManager
+ // Add your methods here
+ 
++zSTRING GetSlotDirName_HostSave(int);
++void CopyToCurrent_HostSave(int);

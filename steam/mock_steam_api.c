@@ -366,7 +366,7 @@ API bool SteamAPI_ISteamFriends_GetFriendGamePlayed(void *self, u64 sid, FriendG
 }
 API const char *SteamAPI_ISteamFriends_GetFriendPersonaName(void *self, u64 sid) { return num_name(sid_num(sid)); }
 API const char *SteamAPI_ISteamFriends_GetPersonaName(void *self) { init_identity(); return num_name(g_num); }
-API const char *SteamAPI_ISteamMatchmaking_GetLobbyData(void *self, u64 lobby, const char *k) { return k && !strcmp(k, "gothic2coop60") ? "1" : ""; }
+API const char *SteamAPI_ISteamMatchmaking_GetLobbyData(void *self, u64 lobby, const char *k) { if(k&&!strcmp(k,"gothic2_host_saves"))return getenv("G2_MOCK_HOST_SAVES")?"1":"";return k && !strcmp(k, "gothic2coop60") ? "1" : ""; }
 API void SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(void *self) {}
 
 /* ---- identity helpers: type int32, size int32, steamid at +8 ---- */

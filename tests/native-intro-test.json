@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "scenario": "native autosave after Xardas dialogue, free slot only",
+  "slot": 19,
+  "path": "C:\\Games\\Gothic2Coop-TestClient\\Saves\\savegame19",
+  "stable_ms": 5000,
+  "dll_sha256": "82588d85baa97ed8e08b627d1c9564176339fde7dd197cb7b4ddbf538aafc945"
+}

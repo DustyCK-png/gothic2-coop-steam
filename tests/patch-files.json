@@ -1,0 +1,18 @@
+[
+  "HostSaves.cpp",
+  "Interface.cpp",
+  "LocalNpc.cpp",
+  "PacketProcessor.cpp",
+  "Plugin.cpp",
+  "RemoteNpc.cpp",
+  "Server.cpp",
+  "SharedGameplay.cpp",
+  "SharedGameplay.h",
+  "Sources.h",
+  "SteamOverlay.cpp",
+  "SyncHelpers.cpp",
+  "UnionHooks.cpp",
+  "ZenGin/Gothic_UserAPI/CGameManager.inl",
+  "ZenGin/Gothic_UserAPI/oCSavegameInfo.inl",
+  "ZenGin/Gothic_UserAPI/oCSavegameManager.inl"
+]

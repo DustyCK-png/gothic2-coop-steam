@@ -214,6 +214,18 @@ static int g_port = 1234;
 static char g_url_extra[512];
 static char g_hx_args[1024];
 static bool g_no_launch;
+static bool g_overlay = true;
+static bool g_overlay_wait;
+static char g_join_request[MAX_PATH], g_join_ready[MAX_PATH];
+static bool g_host_saves;
+extern void campaign_init(const char*,int,u64,u64,int(*)(u64,const void*,int));
+extern void campaign_owner(u64);
+extern int campaign_ready(void);
+extern void campaign_receive(u64,const void*,int);
+extern void campaign_tick(void);
+extern void campaign_prune(int(*)(u64));
+extern int campaign_registered(u64);
+static int campaign_send(u64 id,const void* bytes,int size) {return send_to(id,bytes,size,SEND_RELIABLE,2);}
 static HANDLE g_game;
 
 static void find_game_dir(void)
@@ -242,12 +254,21 @@ static void configure_game(bool hosting, int port) {
     printf("Configured Gothic II: %s, local UDP %d\n",hosting?"host":"client",port);
 }
 
-static void launch_hx(const char *unused) {
+static void launch_hx(u64 lobby) {
     if (g_no_launch) return;
     char exe[MAX_PATH],cmd[MAX_PATH+4],cwd[MAX_PATH];
     snprintf(cwd,sizeof(cwd),"%s\\system",g_game_dir);
     snprintf(exe,sizeof(exe),"%s\\system\\Gothic2.exe",g_game_dir);
     snprintf(cmd,sizeof(cmd),"\"%s\"",exe);
+    char lobby_text[32];
+    snprintf(lobby_text,sizeof(lobby_text),"%llu",(unsigned long long)lobby);
+    SetEnvironmentVariableA("SteamAppId","480");
+    SetEnvironmentVariableA("SteamGameId","480");
+    SetEnvironmentVariableA("G2_COOP_STEAM_OVERLAY",g_overlay?"1":"0");
+    SetEnvironmentVariableA("G2_COOP_STEAM_LOBBY",lobby_text);
+    SetEnvironmentVariableA("G2_COOP_JOIN_REQUEST",g_overlay_wait?g_join_request:NULL);
+    SetEnvironmentVariableA("G2_COOP_JOIN_READY",g_overlay_wait?g_join_ready:NULL);
+    if(!g_host_saves){SetEnvironmentVariableA("G2_COOP_CAMPAIGN",NULL);SetEnvironmentVariableA("G2_COOP_CAMPAIGN_HOST",NULL);}
     STARTUPINFOA si={0}; PROCESS_INFORMATION pi; si.cb=sizeof(si);
     if (!CreateProcessA(exe,cmd,NULL,NULL,FALSE,0,NULL,cwd,&si,&pi)) fail("Cannot launch Gothic2.exe");
     CloseHandle(pi.hThread);g_game=pi.hProcess;
@@ -437,6 +458,7 @@ static bool read_saved_map(char *out, size_t size)
     return out[0] != 0;
 }
 
+static int campaign_member(u64 sid) {return lobby_member(sid)?1:0;}
 static int run_host(const char *map)
 {
     S.CreateLobby(g_mm, 1 /* friends only */, MAX_PEERS + 1);
@@ -444,11 +466,13 @@ static int run_host(const char *map)
     DWORD t0 = GetTickCount();
     while (!g_lobby && !g_lobby_failed && GetTickCount() - t0 < 15000) { pump(host_cb); Sleep(20); }
     if (!g_lobby) fail("Steam did not create a lobby. Check that you are online in Steam.");
+    if(g_host_saves)S.SetLobbyData(g_mm,g_lobby,"gothic2_host_saves","1");
 
     char url[1024];
     snprintf(url, sizeof(url), "%s?Listen?Port=%d?Game=HXFix.HXFixGameInfo%s", map, g_port, g_url_extra);
     configure_game(true,g_port);
-    launch_hx(url);
+    if(g_host_saves)campaign_init(g_game_dir,1,g_me,g_me,campaign_send);
+    launch_hx(g_lobby);
 
     printf("Press I in this window to open the Steam invite dialog.\n");
     printf("\nHosting. Friends join by running G2Steam and choosing Join\n"
@@ -459,6 +483,7 @@ static int run_host(const char *map)
     static unsigned char buf[65536];
     for (;;) {
         pump(host_cb);
+        if(g_host_saves){campaign_prune(campaign_member);void* saves[16];int count;while((count=S.ReceiveMessages(g_msgs,2,saves,16))>0)for(int i=0;i<count;i++){u64 sid=msg_sender(saves[i]);if(lobby_member(sid))campaign_receive(sid,*(void**)saves[i],*(int*)((char*)saves[i]+4));S.MessageRelease(saves[i]);}campaign_tick();}
         void *msgs[64];
         int n;
         while ((n = S.ReceiveMessages(g_msgs, 0, msgs, 64)) > 0) {
@@ -466,6 +491,7 @@ static int run_host(const char *map)
                 u64 sid = msg_sender(msgs[i]);
                 Peer *p = find_peer(sid);
                 if (!lobby_member(sid)) { close_session(sid); S.MessageRelease(msgs[i]); continue; }
+                if(g_host_saves&&!campaign_registered(sid)){S.MessageRelease(msgs[i]);continue;}
                 if (!p) p = add_peer(sid);
                 unsigned char *data = *(unsigned char **)msgs[i];
                 int size = *(int *)((char *)msgs[i] + 4);
@@ -624,6 +650,10 @@ static int run_join(u64 lobby)
     if (!g_host) fail("Could not join the lobby. Is your friend still hosting?");
     const char *tag = S.GetLobbyData(g_mm, g_join_lobby, "gothic2coop60");
     if (!tag || strcmp(tag, "1") != 0) fail("That lobby is not a Gothic II Co-op v60 game.");
+    const char* saves_tag=S.GetLobbyData(g_mm,g_join_lobby,"gothic2_host_saves");
+    bool host_uses_saves=saves_tag&&strcmp(saves_tag,"1")==0;
+    if(host_uses_saves&&!g_host_saves)fail("This host uses shared checkpoints. Start Steam-Join-Saves.cmd.");
+    if(g_host_saves&&!host_uses_saves)fail("The host must start Steam-Host-Saves.cmd for host-owned checkpoints.");
     printf("Host: %s\n", friend_name(g_host));
     accept_session(g_host);
 
@@ -633,7 +663,17 @@ static int run_join(u64 lobby)
     char url[256];
     snprintf(url, sizeof(url), "127.0.0.1:%d", port);
     configure_game(false,port);
-    launch_hx(url);
+    if(g_host_saves&&!g_overlay_wait)campaign_init(g_game_dir,0,g_me,g_host,campaign_send);
+    if(g_host_saves)campaign_owner(g_host);
+    bool endpoint_delivered=false;
+    if (g_overlay_wait && !g_host_saves) {
+        char temp[MAX_PATH+8];snprintf(temp,sizeof(temp),"%s.tmp",g_join_ready);
+        FILE *ready=fopen(temp,"w");if(!ready)fail("Cannot deliver the Steam join endpoint to the game");
+        fprintf(ready,"%d %llu\n",port,(unsigned long long)g_join_lobby);fclose(ready);
+        if(!MoveFileExA(temp,g_join_ready,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))fail("Cannot signal the game to connect");
+        printf("Overlay join ready. Load the host's world; the game will connect automatically.\n");
+        endpoint_delivered=true;
+    } else if(!g_overlay_wait)launch_hx(g_join_lobby);
     printf("Relaying 127.0.0.1:%d <-> %s over Steam. Keep this window open. Close Gothic II to stop.\n", port, friend_name(g_host));
 
     /* one id per game source address (connection), see the top of the file */
@@ -643,8 +683,10 @@ static int run_join(u64 lobby)
     DWORD last_heard = GetTickCount(), last_ping = 0, warned = 0;
     for (;;) {
         pump(join_cb);
+        if(g_host_saves){void* saves[16];int count;while((count=S.ReceiveMessages(g_msgs,2,saves,16))>0)for(int i=0;i<count;i++){if(msg_sender(saves[i])==g_host)campaign_receive(g_host,*(void**)saves[i],*(int*)((char*)saves[i]+4));S.MessageRelease(saves[i]);}campaign_tick();if(g_overlay_wait&&!endpoint_delivered&&campaign_ready()){char temp[MAX_PATH+8];snprintf(temp,sizeof(temp),"%s.tmp",g_join_ready);FILE* ready=fopen(temp,"w");if(!ready)fail("Cannot deliver restored endpoint");fprintf(ready,"%d %llu\n",port,g_join_lobby);fclose(ready);if(!MoveFileExA(temp,g_join_ready,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))fail("Cannot signal restored endpoint");endpoint_delivered=true;}}
         struct sockaddr_in from; int fl = sizeof(from), got;
         while ((got = recvfrom(s, (char *)buf + 1, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl)) > 0) {
+            if(g_host_saves&&!campaign_ready())continue;
             int k;
             for (k = 0; k < games_n; k++)
                 if (games[k].sin_port == from.sin_port && games[k].sin_addr.s_addr == from.sin_addr.s_addr) break;
@@ -695,6 +737,39 @@ static int run_join(u64 lobby)
     return 0;
 }
 
+
+/* Start the game first so the user can choose Friends -> Join Game in its overlay. */
+static u64 g_overlay_target;
+static void overlay_wait_cb(int id, void *data) {
+    if(id==CB_LOBBY_JOIN_REQUESTED)g_overlay_target=((GameLobbyJoinRequested*)data)->lobby;
+    else if(id==CB_RICH_PRESENCE_JOIN)g_overlay_target=parse_connect(((GameRichPresenceJoinRequested*)data)->connect);
+}
+static int run_overlay(void) {
+    if(!g_overlay)fail("Overlay mode requires the in-game overlay; remove --no-overlay");
+    g_overlay_wait=true;
+    if(snprintf(g_join_request,sizeof(g_join_request),"%s\\.g2steam-%lu.join",g_game_dir,GetCurrentProcessId())>=sizeof(g_join_request)-7)fail("Game path too long");
+    snprintf(g_join_ready,sizeof(g_join_ready),"%s.ready",g_join_request);
+    DeleteFileA(g_join_request);DeleteFileA(g_join_ready);
+    if(g_host_saves)campaign_init(g_game_dir,0,g_me,0,campaign_send);
+    launch_hx(0);
+    printf("Open Shift+Tab -> Friends -> your host -> Join Game. Keep this relay open.\n");
+    while(!g_overlay_target) {
+        pump(overlay_wait_cb);
+        FILE* request=fopen(g_join_request,"r");
+        if(request) {
+            unsigned long long target=0;char extra=0;
+            int fields=fscanf(request,"%llu %c",&target,&extra);fclose(request);DeleteFileA(g_join_request);
+            if(fields==1 && target>1000){g_overlay_target=target;printf("Overlay join request received.\n");}
+            else printf("Ignored invalid overlay join request.\n");
+        }
+        if(game_exited())return 0;
+        Sleep(20);
+    }
+    int result=run_join(g_overlay_target);
+    DeleteFileA(g_join_request);DeleteFileA(g_join_ready);
+    return result;
+}
+
 /* ---------------------------------------------------------------- main */
 
 int main(int argc, char **argv)
@@ -707,7 +782,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) g_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--url-extra") && i + 1 < argc) snprintf(g_url_extra, sizeof(g_url_extra), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--hx-args") && i + 1 < argc) snprintf(g_hx_args, sizeof(g_hx_args), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--no-overlay")) g_overlay = false;
         else if (!strcmp(argv[i], "--no-launch")) g_no_launch = true;
+        else if (!strcmp(argv[i], "--host-saves")) g_host_saves = true;
         else if (!strcmp(argv[i], "+connect_lobby") && i + 1 < argc) { mode = "join"; arg = argv[++i]; }
         else if (!mode) mode = argv[i];
         else if (!arg) arg = argv[i];
@@ -722,11 +799,11 @@ int main(int argc, char **argv)
     printf("Gothic II Co-op over Steam - signed in as %s\n\n", S.GetPersonaName(g_friends));
 
     if (!mode) {
-        printf("  1) Host a game\n  2) Join a friend's game\n\nChoose 1 or 2: ");
+        printf("  1) Host a game\n  2) Join through the in-game Steam overlay\n\nChoose 1 or 2: ");
         for (;;) {
             int c = _getch();
             if (c == '1') { mode = "host"; break; }
-            if (c == '2') { mode = "join"; break; }
+            if (c == '2') { mode = "overlay"; break; }
             if (c == 27) return 0;
         }
         printf("%c\n\n", mode[0] == 'h' ? '1' : mode[0] == 'j' ? '2' : '3');
@@ -744,8 +821,9 @@ int main(int argc, char **argv)
     }
     int r;
     if (!_stricmp(mode,"host")) r=run_host("new");
+    else if (!_stricmp(mode,"overlay")) r=run_overlay();
     else if (!_stricmp(mode,"join")) r=run_join(arg?strtoull(arg,NULL,10):0);
-    else fail("Usage: G2Steam.exe host|join [lobby-id] --game <Gothic II copy>");
+    else fail("Usage: G2Steam.exe host|overlay|join [lobby-id] --game <Gothic II copy>");
     S.Shutdown();
     return r;
 }

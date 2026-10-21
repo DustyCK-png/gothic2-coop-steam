@@ -1,0 +1,13 @@
+{
+  "status": "passed",
+  "transport": "Steam API mock, not real Steam",
+  "scenario": "overlay join handoff and UDP round trip",
+  "invalid_request_rejected": true,
+  "validated_endpoint_delivered": true,
+  "packet_sizes": [
+    1,
+    64,
+    1400,
+    16000
+  ]
+}

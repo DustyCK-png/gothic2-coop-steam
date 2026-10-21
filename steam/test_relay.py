@@ -4,6 +4,8 @@ test=ROOT/'steam-tests'
 processes=[]
 logs=[]
 report={'status':'failed','transport':'Steam API mock, not real Steam'}
+overlay_test=os.environ.get('G2_RELAY_OVERLAY_TEST')=='1'
+if overlay_test:report['scenario']='overlay join handoff and UDP round trip'
 def wait(predicate):
     end=time.monotonic()+20
     while time.monotonic()<end:
@@ -19,8 +21,22 @@ def launch(role,game,port):
     env=os.environ.copy();env['KFX_MOCK_STEAM_NAME']='Host' if role=='host' else 'Client'
     env['KFX_MOCK_STEAM_PORT_BASE']='48300'
     logfile=folder/'relay.log';f=logfile.open('w');logs.append(f)
-    p=subprocess.Popen([str(folder/'G2Steam.exe'),'host' if role=='host' else 'join','--game',str(game),'--port',str(port),'--no-launch'],cwd=folder,env=env,stdout=f,stderr=subprocess.STDOUT)
-    processes.append(p);wait(lambda:'Configured Gothic II:' in logfile.read_text(errors='replace'))
+    mode='host' if role=='host' else ('overlay' if overlay_test else 'join')
+    p=subprocess.Popen([str(folder/'G2Steam.exe'),mode,'--game',str(game),'--port',str(port),'--no-launch'],cwd=folder,env=env,stdout=f,stderr=subprocess.STDOUT)
+    processes.append(p)
+    if mode=='overlay':
+        wait(lambda:'Open Shift+Tab' in logfile.read_text(errors='replace'))
+        request=game/f'.g2steam-{p.pid}.join'
+        request.write_text('invalid lobby\n')
+        wait(lambda:'Ignored invalid overlay join request.' in logfile.read_text(errors='replace'))
+        request.write_text(str(0x0186000000000000+1)+'\n')
+        ready=pathlib.Path(str(request)+'.ready')
+        wait(lambda:ready.exists())
+        endpoint,lobby=map(int,ready.read_text().split())
+        assert 1<=endpoint<=65535 and lobby==0x0186000000000000+1
+        report['invalid_request_rejected']=True
+        report['validated_endpoint_delivered']=True
+    wait(lambda:'Configured Gothic II:' in logfile.read_text(errors='replace'))
 try:
     port=39568
     host_game=test/'fake-host';client_game=test/'fake-client'
@@ -45,7 +61,8 @@ finally:
     for p in reversed(processes):
         if p.poll() is None:p.terminate();p.wait(timeout=10)
     for f in logs:f.close()
-    (ROOT/'local/steam-relay-test.json').write_text(json.dumps(report,indent=2))
+    (ROOT/'local').mkdir(exist_ok=True)
+    (ROOT/'local'/('steam-overlay-join-test.json' if overlay_test else 'steam-relay-test.json')).write_text(json.dumps(report,indent=2))
     print(json.dumps(report))
     if report['status']!='passed':
         for role in ('host','client'):

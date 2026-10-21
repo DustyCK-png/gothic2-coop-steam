@@ -1,0 +1,48 @@
+{
+  "xp": {
+    "detected": true,
+    "error": "Native party QA timeout",
+    "assertions": {
+      "both_player_models_visible": true
+    }
+  },
+  "render": {
+    "detected": true,
+    "error": "{'error': 'Puppet failed to respawn', 'id': '1792571661965437600', 'ok': False}",
+    "assertions": {
+      "both_player_models_visible": true,
+      "host_reward_shared_once": true,
+      "duplicate_reward_ignored": true,
+      "client_reward_shared_once": true,
+      "equal_legitimate_rewards_preserved": true,
+      "native_level_up_and_learning_points": true
+    }
+  },
+  "dialogue": {
+    "detected": true,
+    "error": "Host started a second dialogue",
+    "assertions": {
+      "both_player_models_visible": true,
+      "host_reward_shared_once": true,
+      "duplicate_reward_ignored": true,
+      "client_reward_shared_once": true,
+      "equal_legitimate_rewards_preserved": true,
+      "native_level_up_and_learning_points": true,
+      "distance_respawn_and_gear": true
+    }
+  },
+  "quest": {
+    "detected": true,
+    "error": "Native party QA timeout",
+    "assertions": {
+      "both_player_models_visible": true,
+      "host_reward_shared_once": true,
+      "duplicate_reward_ignored": true,
+      "client_reward_shared_once": true,
+      "equal_legitimate_rewards_preserved": true,
+      "native_level_up_and_learning_points": true,
+      "distance_respawn_and_gear": true,
+      "exclusive_dialogue": true
+    }
+  }
+}
