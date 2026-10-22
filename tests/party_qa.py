@@ -30,7 +30,7 @@ def launch(index):
  for name in ('PartyQA.command','PartyQA.reply','PartyQA.state'):
   p=system/name
   if p.exists():p.replace(p.with_suffix('.previous'))
- env=os.environ.copy();env['G2_COOP_QA']='party-host' if index==0 else 'party-client';env.pop('G2_COOP_CAMPAIGN',None);env.pop('G2_COOP_CAMPAIGN_HOST',None);env['G2_COOP_QA_FAULT']=sys.argv[1] if len(sys.argv)>1 and index==0 else ''
+ env=os.environ.copy();env['G2_COOP_QA']='party-host' if index==0 else 'party-client';env.pop('G2_COOP_CAMPAIGN',None);env.pop('G2_COOP_CAMPAIGN_HOST',None);env['G2_COOP_QA_FAULT']=sys.argv[1] if len(sys.argv)>1 and (index==0 or sys.argv[1]=='native-dialogue') else ''
  p=subprocess.Popen([str(system/'Gothic2.exe')],cwd=system,env=env,creationflags=4 if index else 0);ps.append(p);print('started',index,p.pid,flush=True)
  if index:patch_client(p)
  wait(lambda:read(system/'PartyQA.state').get('finished'));time.sleep(2)
@@ -68,17 +68,26 @@ try:
  wait(lambda:all(state(i)['level']==old[i][0]+1 and state(i)['lp']==old[i][1]+10 for i in (0,1)))
  report['native_level_up_and_learning_points']=True
  command(0,'puppet-cycle');wait(lambda:visible(0));report['distance_respawn_and_gear']=True
- command(1,'dialogue',npc='NONE_100_XARDAS');wait(lambda:state(0).get('owner')=='FRIEND_1' and state(1).get('owner')=='FRIEND_1')
+ command(1,'native-dialogue',npc='NONE_100_XARDAS');wait(lambda:state(0).get('owner')=='FRIEND_1' and state(1).get('owner')=='FRIEND_1')
  blocked=command(0,'dialogue',npc='BAU_950_LOBART')['state']
  assert blocked['owner']=='FRIEND_1' and blocked['finished'],'Host started a second dialogue'
+ wait(lambda:state(1).get('options_active'),20)
+ report['native_dialogue_options_open']=True
+ command(1,'dialogue-exit');wait(lambda:state(1).get('finished') and state(1).get('owner')=='',20)
+ command(1,'native-dialogue',npc='NONE_100_XARDAS');wait(lambda:state(1).get('options_active'),20)
+ report['native_dialogue_stop_and_reopen']=True
  report['exclusive_dialogue']=True
+ if len(sys.argv)>1 and sys.argv[1]=='idle-before-grant':
+  report['scenario']='Focused dialogue ordering regression: idle snapshot before grant, active options, native stop and reopen'
+  report['status']='passed';raise SystemExit(0)
  command(1,'real-quest');assert command(1,'finish')['state']['quest']['globals']['MIS_LOBART_RUEBEN']==[1],'Real quest accept did not start mission'
  wait(lambda:state(0).get('quest',{}).get('globals',{}).get('MIS_LOBART_RUEBEN')==[1])
+ wait(lambda:state(0).get('owner')=='' and state(1).get('owner')=='')
  report['native_lobart_quest_accepted_and_shared']=True
  command(1,'dialogue',npc='NONE_100_XARDAS');wait(lambda:state(1).get('owner')=='FRIEND_1');command(1,'quest',value=1);command(1,'finish')
  wait(lambda:state(0).get('owner')=='' and state(0).get('quest',{}).get('globals',{}).get('MIS_LOBART_RUEBEN')==[1])
  wait(lambda:state(1).get('owner')=='')
- assert any(t['title']=='QA: shared Lobart quest' for t in state(0)['quest']['journal'])
+ wait(lambda:any(t['title']=='QA: shared Lobart quest' for t in state(0).get('quest',{}).get('journal',[])))
  report['client_quest_flag_and_journal_shared']=True
  command(0,'reject-invalid');report['invalid_quest_packet_atomic']=True
  command(1,'dialogue',npc='NONE_100_XARDAS');wait(lambda:state(1).get('owner')=='FRIEND_1')

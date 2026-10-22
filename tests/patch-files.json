@@ -1,4 +1,5 @@
 [
+  "Hooks.cpp",
   "HostSaves.cpp",
   "Interface.cpp",
   "LocalNpc.cpp",

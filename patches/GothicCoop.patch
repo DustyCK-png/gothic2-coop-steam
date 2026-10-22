@@ -1,3 +1,15 @@
+diff --git a/Hooks.cpp b/Hooks.cpp
+--- a/Hooks.cpp
++++ b/Hooks.cpp
+@@ -387,7 +387,7 @@
+             return;
+         }
+ 
+-        if (ClientThread && IsPlayerTalkingWithNpc(_this->homeVob)) {
++        if (ClientThread && (IsPlayerTalkingWithNpc(_this->homeVob)||SharedGameplay::ProtectDialogueNpc(_this->homeVob))) {
+             Ivk_zCModel_StartAni(_this, a, b);
+             return;
+         }
 diff --git a/HostSaves.cpp b/HostSaves.cpp
 new file mode 100644
 --- /dev/null
@@ -437,6 +449,15 @@ diff --git a/RemoteNpc.cpp b/RemoteNpc.cpp
          bool isSpawned = false;
          bool hasNpc = false;
          bool hasModel = false;
+@@ -42,7 +45,7 @@
+                 npc = UniqueNameToNpcList[name];
+             }
+ 
+-            if (npc && IsPlayerTalkingWithNpc(npc)) {
++            if (npc && (IsPlayerTalkingWithNpc(npc)||SharedGameplay::ProtectDialogueNpc(npc))) {
+                 return;
+             }
+ 
 @@ -50,7 +53,7 @@
                  return;
              }
@@ -684,13 +705,18 @@ diff --git a/SharedGameplay.cpp b/SharedGameplay.cpp
 new file mode 100644
 --- /dev/null
 +++ b/SharedGameplay.cpp
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,272 @@
 +// SPDX-License-Identifier: AGPL-3.0-or-later
 +// Host-authorized rewards and dialogue leases. Quest coverage is explicitly bounded.
 +namespace GOTHIC_ENGINE { namespace SharedGameplay {
 +    constexpr int TYPE=1000;
 +    bool Fault(const char* name){char role[64]={0},fault[64]={0};GetEnvironmentVariableA("G2_COOP_QA",role,sizeof role);if(strcmp(role,"party-host")&&strcmp(role,"party-client"))return false;GetEnvironmentVariableA("G2_COOP_QA_FAULT",fault,sizeof fault);return !strcmp(name,fault);}
-+    static bool qaAllowDialogue=false;
++    static bool qaAllowDialogue=false,qaNativeConversation=false;
++    static unsigned long nativeInfoUpdates=0;
++    static oCMsgConversation* pendingNativeMessage=nullptr;
++    static oCNpc* pendingNativeActor=nullptr;
++    static oCNpc* pendingNativeTarget=nullptr;
++    static bool nativeAborted=false;
 +    static unsigned long long sourceEvent=0;
 +    static DWORD lastLeaseAck=0;
 +    static bool qaPauseLease=false;
@@ -737,7 +763,15 @@ new file mode 100644
 +    static void Publish(){++revision;baseline=State();Send({{"kind","state"},{"epoch",epoch},{"rev",revision},{"xpseq",xpSequence},{"state",baseline},{"owner",owner},{"lease",lease}});}
 +    static std::string NpcKey(oCNpc* npc){if(!npc)return {};auto i=NpcToUniqueNameList.find(npc);return i!=NpcToUniqueNameList.end()?std::string(i->second.ToChar()):std::string(npc->GetInstanceName().ToChar());}
 +    static std::string CombatKey(oCNpc* npc){return "combat:"+std::string(ogame->GetGameWorld()->worldName.ToChar())+":"+NpcKey(npc);}
-+    static void StopDialogue(){auto& info=oCInformationManager::GetInformationManager();if(!info.HasFinished()||info.WaitingForEnd()){info.Exit();info.OnTermination();}dialogueStarted=false;commitSent=false;pendingRequest=0;pendingNpc.clear();}
++    bool ProtectDialogueNpc(zCVob* vob){if(!vob||!ClientThread)return false;if(player&&player->talkOther==vob)return true;auto npc=zDYNAMIC_CAST<oCNpc>(vob);if(npc&&npc->talkOther==player)return true;if(pendingRequest&&(vob==pendingNativeTarget||vob==pendingNativeActor))return true;auto& info=oCInformationManager::GetInformationManager();return owner==Me()&&info.Npc==vob&&!info.HasFinished();}
++    static void ClearNativeDialogue(){pendingNativeMessage=nullptr;pendingNativeActor=nullptr;pendingNativeTarget=nullptr;nativeAborted=false;}
++    static void StopDialogue(){
++        auto& info=oCInformationManager::GetInformationManager();auto actor=pendingNativeActor;auto target=pendingNativeTarget?pendingNativeTarget:info.Npc;
++        nativeAborted=pendingNativeMessage!=nullptr;
++        if(!info.HasFinished()||info.WaitingForEnd()){info.Exit();info.OnTermination();}
++        if(actor)actor->StopTalkingWith();if(target)target->StopTalkingWith();if(player)player->StopTalkingWith();
++        dialogueStarted=false;commitSent=false;pendingRequest=0;pendingNpc.clear();
++    }
 +    static oCNpc* Resolve(const std::string& key){auto n=UniqueNameToNpcList.find(key.c_str());if(n!=UniqueNameToNpcList.end())return n->second;for(auto p=ogame->GetGameWorld()->voblist_npcs->next;p;p=p->next)if(p->data&&key==p->data->GetInstanceName().ToChar())return p->data;return nullptr;}
 +    static void Release(){owner.clear();commitSent=false;dialogueStarted=false;pendingRequest=0;pendingNpc.clear();Publish();}
 +    static bool Acquire(const std::string& who,const std::string& npc,unsigned long long request){if(!owner.empty()||!Resolve(npc))return false;owner=who;++lease;leaseRevision=revision;leaseHeard=GetTickCount();awardOrdinal=0;candidatesBefore=Globals(true);Send({{"kind","grant"},{"epoch",epoch},{"owner",owner},{"lease",lease},{"request",request},{"npc",npc},{"rev",leaseRevision},{"state",State()}});return true;}
@@ -746,7 +780,7 @@ new file mode 100644
 +    static void __fastcall GateInfo(oCInformationManager* info,oCNpc* npc);
 +    static CInvoke<void(__fastcall*)(oCInformationManager*,oCNpc*)> OriginalInfo(0x006609F0,&GateInfo);
 +    static void __fastcall GateInfo(oCInformationManager* info,oCNpc* npc){
-+        if((QaRole("party-host")||QaRole("party-client"))&&!qaAllowDialogue)return;
++        if((QaRole("party-host")||QaRole("party-client"))&&!qaAllowDialogue&&!qaNativeConversation)return;
 +        if(!npc||(!ServerThread&&!ClientThread)||startingDialogue){OriginalInfo(info,npc);return;}
 +        if(!started){OriginalInfo(info,npc);return;}
 +        if(owner==Me()){if(commitSent)return;dialogueStarted=true;OriginalInfo(info,npc);return;}
@@ -754,6 +788,47 @@ new file mode 100644
 +        if(!owner.empty()){ChatLog("Another player is talking. Wait until the dialogue finishes.");return;}
 +        if(ServerThread){if(Acquire("HOST",NpcKey(npc),0)){dialogueStarted=true;OriginalInfo(info,npc);}return;}
 +        if(!pendingRequest){pendingRequest=++requestCounter;pendingNpc=NpcKey(npc);pendingSince=GetTickCount();Send({{"kind","request"},{"request",pendingRequest},{"npc",pendingNpc}});}
++    }
++    static int __fastcall AssessTalkHook(oCNpc*,void*,oCNpc*);
++    static CInvoke<int(__thiscall*)(oCNpc*,oCNpc*)> OriginalAssessTalk(0x0075C890,&AssessTalkHook);
++    static int __fastcall AssessTalkHook(oCNpc* npc,void*,oCNpc* other){
++        if(started&&(ServerThread||ClientThread)&&other==player&&((!owner.empty()&&owner!=Me())||(owner==Me()&&commitSent))&&!Fault("dialogue")){ChatLog("Another player is talking. Try again afterwards.");return 0;}
++        return OriginalAssessTalk(npc,other);
++    }
++    // SetNpc can be deferred by the lease handshake. Keep the native PROCESSINFOS
++    // event alive until it has actually initialized the information manager.
++    static int __fastcall ProcessInfosHook(oCNpc*,void*,oCMsgConversation*);
++    static CInvoke<int(__thiscall*)(oCNpc*,oCMsgConversation*)> OriginalProcessInfos(0x0075A680,&ProcessInfosHook);
++    static int NativeDialogueDecision(oCNpc* actor,oCMsgConversation* message){
++        if((!ClientThread&&!ServerThread)||!started||Fault("native-dialogue"))return 0;
++        if(commitSent&&owner==Me()&&!message->IsInUse()){actor->StopTalkingWith();if(player)player->StopTalkingWith();return 2;}
++        if(ServerThread){if(!owner.empty()&&owner!="HOST"){actor->StopTalkingWith();auto target=zDYNAMIC_CAST<oCNpc>(message->target);if(target)target->StopTalkingWith();return 2;}return 0;}
++        if(message==pendingNativeMessage&&nativeAborted){
++            actor->StopTalkingWith();if(pendingNativeTarget)pendingNativeTarget->StopTalkingWith();
++            pendingNativeMessage=nullptr;pendingNativeActor=nullptr;pendingNativeTarget=nullptr;nativeAborted=false;return 2;
++        }
++        if(!message->IsInUse()&&owner!=Me()){
++            if(!owner.empty()){actor->StopTalkingWith();auto target=zDYNAMIC_CAST<oCNpc>(message->target);if(target)target->StopTalkingWith();ChatLog("Another player is talking. Try again afterwards.");return 2;}
++            if(!pendingRequest){pendingNativeMessage=message;pendingNativeActor=actor;pendingNativeTarget=zDYNAMIC_CAST<oCNpc>(message->target);nativeAborted=false;GateInfo(&oCInformationManager::GetInformationManager(),pendingNativeTarget);}
++            if(pendingRequest)return 1;
++        }
++        return message==pendingNativeMessage&&pendingRequest&&owner!=Me()?1:0;
++    }
++    static int __fastcall ProcessInfosHook(oCNpc* actor,void*,oCMsgConversation* message){
++        int decision=NativeDialogueDecision(actor,message);if(decision)return decision==2?1:0;
++        ++nativeInfoUpdates;int result=OriginalProcessInfos(actor,message);if(result&&message==pendingNativeMessage)ClearNativeDialogue();return result;
++    }
++    // The real OnMessage dispatcher inlines PROCESSINFOS rather than calling
++    // EV_ProcessInfos, so both entry points must retain the pending job.
++    static void __fastcall DialogueMessageHook(oCNpc*,void*,zCEventMessage*,zCVob*);
++    static CInvoke<void(__thiscall*)(oCNpc*,zCEventMessage*,zCVob*)> OriginalDialogueMessage(0x0074B020,&DialogueMessageHook);
++    static void __fastcall DialogueMessageHook(oCNpc* actor,void*,zCEventMessage* event,zCVob* source){
++        auto message=zDYNAMIC_CAST<oCMsgConversation>(event);
++        if(message&&message->subType==oCMsgConversation::EV_PROCESSINFOS){
++            int decision=NativeDialogueDecision(actor,message);if(decision){if(decision==2){message->Delete();if(message==pendingNativeMessage)ClearNativeDialogue();}return;}++nativeInfoUpdates;
++            event->AddRef();OriginalDialogueMessage(actor,event,source);if(message==pendingNativeMessage&&message->IsDeleted())ClearNativeDialogue();event->Release();return;
++        }
++        OriginalDialogueMessage(actor,event,source);
 +    }
 +    static void ApplyXP(int amount){if(amount<=0)return;auto previous=applyingXP;applyingXP=true;int function=parser->GetIndex("B_GIVEPLAYERXP");parser->CallFunc(function,amount);applyingXP=previous;}
 +    static void Grant(const std::string& key,int amount){if(amount<=0||amount>10000000||rewards.count(key))return;rewards.insert(key);ApplyXP(amount);++xpSequence;lastGrant={{"kind","xp"},{"epoch",epoch},{"seq",xpSequence},{"amount",amount},{"key",key}};if(!Fault("xp"))Send(lastGrant);Trace()<<"grant "<<xpSequence<<" "<<key<<" "<<amount<<"\n";}
@@ -783,7 +858,7 @@ new file mode 100644
 +            auto kind=e.at("kind").get<std::string>();auto from=e.at("id").get<std::string>();
 +            if(ServerThread){
 +                if(kind=="hello"){Send({{"kind","state"},{"to",from},{"epoch",epoch},{"rev",revision},{"xpseq",xpSequence},{"state",State()},{"owner",owner},{"lease",lease}});return;}
-+                if(kind=="request"){if(!Acquire(from,e.at("npc"),e.at("request")))Send({{"kind","denied"},{"to",from},{"request",e.at("request")}});return;}
++                if(kind=="request"){if(Fault("idle-before-grant"))Publish();if(!Acquire(from,e.at("npc"),e.at("request")))Send({{"kind","denied"},{"to",from},{"request",e.at("request")}});return;}
 +                if(kind=="keep"&&owner==from&&e.at("lease")==lease){leaseHeard=GetTickCount();Send({{"kind","keep_ack"},{"to",from},{"lease",lease}});return;}
 +                if(kind=="commit"&&owner==from&&e.at("lease")==lease&&e.at("rev")==leaseRevision){if(!Fault("quest"))Apply(e.at("state"),true);Release();return;}
 +                if(kind=="delta"&&owner.empty()&&e.at("rev")==revision){Apply(e.at("state"));Publish();return;}
@@ -804,16 +879,16 @@ new file mode 100644
 +                if(owner==Me()&&(e.at("owner")!=Me()||e.at("lease")!=lease))StopDialogue();
 +                bool newEpoch=epoch!=e.at("epoch");epoch=e.at("epoch");revision=e.at("rev");if(newEpoch)lastXP=e.at("xpseq");
 +                Apply(e.at("state"),true);baseline=State();owner=e.at("owner");lease=e.at("lease");ready=true;
-+                if(owner.empty()){commitSent=false;dialogueStarted=false;pendingRequest=0;pendingNpc.clear();}return;
++                if(owner.empty()){commitSent=false;dialogueStarted=false;if(!pendingRequest||nativeAborted){pendingRequest=0;pendingNpc.clear();}}return;
 +            }
 +            if(kind=="grant"){
 +                if(owner==Me()&&(e.at("owner")!=Me()||e.at("lease")!=lease))StopDialogue();
 +                owner=e.at("owner");lease=e.at("lease");lastLeaseAck=GetTickCount();if(owner!=Me())return;
 +                if(!pendingRequest||pendingRequest!=e.at("request")||GetTickCount()-pendingSince>10000){Send({{"kind","commit"},{"lease",lease},{"rev",e.at("rev")},{"state",e.at("state")}});return;}
 +                epoch=e.at("epoch");revision=e.at("rev");Apply(e.at("state"),true);baseline=State();candidatesBefore=Globals(true);awardOrdinal=0;
-+                auto npc=Resolve(pendingNpc);if(npc){startingDialogue=true;dialogueStarted=true;OriginalInfo(&oCInformationManager::GetInformationManager(),npc);startingDialogue=false;}return;
++                auto npc=Resolve(pendingNpc);if(pendingNativeMessage){Trace()<<"grant native dialogue lease="<<lease<<" npc="<<pendingNpc<<"\n";return;}if(npc){startingDialogue=true;dialogueStarted=true;OriginalInfo(&oCInformationManager::GetInformationManager(),npc);startingDialogue=false;}return;
 +            }
-+            if(kind=="denied"&&e.at("to")==Me()&&e.at("request")==pendingRequest){pendingRequest=0;pendingNpc.clear();ChatLog("Another player is talking. Try again after the dialogue.");return;}
++            if(kind=="denied"&&e.at("to")==Me()&&e.at("request")==pendingRequest){nativeAborted=pendingNativeMessage!=nullptr;pendingRequest=0;pendingNpc.clear();ChatLog("Another player is talking. Try again after the dialogue.");return;}
 +            if(kind=="xp"&&ready&&e.at("epoch")==epoch){auto sequence=e.at("seq").get<unsigned long long>();if(sequence<=lastXP)return;lastXP=sequence;ApplyXP(e.at("amount"));return;}
 +        }catch(const std::exception& ex){Trace()<<"Rejected control: "<<ex.what()<<"\n";}
 +    }
@@ -828,23 +903,32 @@ new file mode 100644
 +            else if(ClientThread&&!qaPauseLease&&now-heartbeat>1000){heartbeat=now;Send({{"kind","keep"},{"lease",lease}});}
 +        }
 +        if(ServerThread&&!owner.empty()&&owner!="HOST"&&now-leaseHeard>15000)Release();
-+        if(ClientThread&&pendingRequest&&owner!=Me()&&now-pendingSince>10000){pendingRequest=0;pendingNpc.clear();}
++        if(ClientThread&&pendingRequest&&owner!=Me()&&now-pendingSince>10000){nativeAborted=pendingNativeMessage!=nullptr;pendingRequest=0;pendingNpc.clear();}
 +        if(now<nextPoll||!ready||!owner.empty())return;nextPoll=now+500;
 +        auto current=State();if(current!=baseline){if(ServerThread)Publish();else {json g=json::object();for(auto& p:current["globals"].items())if(baseline["globals"].contains(p.key())&&p.value()!=baseline["globals"][p.key()])g[p.key()]=p.value();current["globals"]=g;Send({{"kind","delta"},{"rev",revision},{"state",current}});baseline=State();}}
 +    }
 +    void Save(const std::filesystem::path& directory){std::filesystem::create_directories(directory);std::ofstream out(directory/"COOPGAME.SAV");out<<json({{"rewards",rewards},{"names",sharedNames},{"sequence",xpSequence}}).dump();}
-+    void Load(const std::filesystem::path& directory){started=false;ready=false;pendingCombat.clear();owner.clear();pendingRequest=0;dialogueStarted=false;commitSent=false;rewards.clear();sharedNames.clear();xpSequence=0;std::ifstream in(directory/"COOPGAME.SAV");if(in){json state;in>>state;rewards=state.value("rewards",std::set<std::string>());sharedNames=state.value("names",std::set<std::string>());xpSequence=state.value("sequence",0ULL);}}
++    void Load(const std::filesystem::path& directory){started=false;ready=false;pendingNativeMessage=nullptr;pendingNativeActor=nullptr;pendingNativeTarget=nullptr;nativeAborted=false;pendingCombat.clear();owner.clear();pendingRequest=0;dialogueStarted=false;commitSent=false;rewards.clear();sharedNames.clear();xpSequence=0;std::ifstream in(directory/"COOPGAME.SAV");if(in){json state;in>>state;rewards=state.value("rewards",std::set<std::string>());sharedNames=state.value("names",std::set<std::string>());xpSequence=state.value("sequence",0ULL);}}
 +    bool CanSave(){return owner.empty();}
++    static json QaMessages(oCNpc* npc){json out=json::array();if(npc){auto em=npc->GetEM();for(int i=0;i<em->messageList.GetNum();++i){auto m=em->messageList[i];if(m)out.push_back({{"kind",m->_GetClassDef()->className.ToChar()},{"subtype",m->subType},{"deleted",m->IsDeleted()}});}}return out;}
 +    static json QaState(){
 +        auto& info=oCInformationManager::GetInformationManager();json npcs=json::array();
 +        for(auto& p:SyncNpcs){auto r=p.second;if(!r||!IsCoopPlayer(p.first))continue;auto n=r->npc;json v={{"name",string(p.first).ToChar()},{"npc",n!=nullptr},{"model",n&&n->GetModel()!=nullptr},{"leaf",n?n->vobLeafList.GetNum():0},{"world",n&&n->GetHomeWorld()==ogame->GetWorld()},{"visible",n?int(n->showVisual):0}};npcs.push_back(v);}
-+        return {{"ready",ready},{"xp",player->experience_points},{"next",player->experience_points_next_level},{"level",player->level},{"lp",player->learn_points},{"owner",owner},{"lease",lease},{"finished",info.HasFinished()!=0},{"waiting",info.WaitingForEnd()!=0},{"core_count",Globals().size()},{"quest",State()},{"puppets",npcs}};
++        return {{"player_messages",QaMessages(player)},{"npc_messages",QaMessages(info.Npc)},{"info_npc",info.Npc?info.Npc->GetInstanceName().ToChar():""},{"native_info_updates",nativeInfoUpdates},{"options",(info.DlgStatus?info.DlgStatus->Choices:0)+(info.DlgChoice?info.DlgChoice->Choices:0)},{"options_active",(info.DlgStatus&&info.DlgStatus->Choices>0&&info.DlgStatus->IsActivated&&info.DlgStatus->HasOpened)||(info.DlgChoice&&info.DlgChoice->Choices>0&&info.DlgChoice->IsActivated&&info.DlgChoice->HasOpened)},{"bye_index",info.IndexBye},{"waiting_script",info.IsWaitingForScript},{"waiting_open",info.IsWaitingForOpen},{"waiting_selection",info.IsWaitingForSelection},{"ready",ready},{"xp",player->experience_points},{"next",player->experience_points_next_level},{"level",player->level},{"lp",player->learn_points},{"owner",owner},{"lease",lease},{"finished",info.HasFinished()!=0},{"waiting",info.WaitingForEnd()!=0},{"core_count",Globals().size()},{"quest",State()},{"puppets",npcs}};
 +    }
 +    void QaTick(){
 +        if(!QaRole("party-host")&&!QaRole("party-client"))return;
 +        if(!player||!ogame||!ogame->GetWorld()||IsLoadingLevel)return;
 +        char exe[MAX_PATH];GetModuleFileNameA(NULL,exe,MAX_PATH);auto system=std::filesystem::path(exe).parent_path();
 +        auto& info=oCInformationManager::GetInformationManager();
++        static bool qaIntroCleared=false;
++        if(!ServerThread&&!ClientThread&&!qaIntroCleared){
++            auto xardas=Resolve("NONE_100_XARDAS");
++            if(!info.HasFinished()||info.WaitingForEnd()){info.Exit();info.OnTermination();}
++            player->GetEM()->KillMessages();player->StopTalkingWith();
++            if(xardas){xardas->GetEM()->KillMessages();xardas->state.ClearAIState();xardas->StopTalkingWith();int instance=xardas->GetInstance();for(auto n=ogame->infoman->infoList.next;n;n=n->next)if(n->data&&n->data->pd.npc==instance&&n->data->pd.important&&!n->data->pd.permanent)n->data->SetTold(1);}
++            qaIntroCleared=true;return;
++        }
 +        if(!ServerThread&&!ClientThread&&(!info.HasFinished()||info.WaitingForEnd())){info.Exit();info.OnTermination();return;}
 +        static DWORD next=0;if(GetTickCount()>=next){next=GetTickCount()+250;std::ofstream out(system/"PartyQA.state");out<<QaState().dump();}
 +        auto path=system/"PartyQA.command";if(!std::filesystem::exists(path))return;
@@ -857,6 +941,9 @@ new file mode 100644
 +            }else if(op=="xp"){int amount=cmd.at("amount");parser->CallFunc(parser->GetIndex("B_GIVEPLAYERXP"),amount);}
 +            else if(op=="repeat-xp"){if(lastGrant.is_null())throw std::runtime_error("No award");Send(lastGrant);Send(lastGrant);}
 +            else if(op=="near-level"){player->experience_points=player->experience_points_next_level-10;}
++            else if(op=="native-dialogue"){
++                auto npc=Resolve(cmd.at("npc"));if(!npc)throw std::runtime_error("NPC missing");qaNativeConversation=true;if(owner.empty()){auto position=npc->GetPositionWorld();npc->Enable(position);player->SetPositionWorld(position+zVEC3(150,0,0));}int accepted=npc->AssessTalk_S(player);reply["assess_talk"]=accepted;
++            }
 +            else if(op=="dialogue"){auto npc=Resolve(cmd.at("npc"));if(!npc)throw std::runtime_error("NPC missing");qaAllowDialogue=true;GateInfo(&info,npc);qaAllowDialogue=false;}
 +            else if(op=="lease-pause"){qaPauseLease=true;}
 +            else if(op=="reject-invalid"){
@@ -867,6 +954,10 @@ new file mode 100644
 +                if(!victim)throw std::runtime_error("No living scavenger");auto position=player->GetPositionWorld()+zVEC3(150,0,0);victim->Enable(position);reply["victim"]=key;
 +            }
 +            else if(op=="kill"){auto victim=Resolve(cmd.at("npc"));if(!victim)throw std::runtime_error("Missing victim");victim->SetAttribute(NPC_ATR_HITPOINTS,1);victim->OnDamage(victim,player,100000,4,victim->GetPositionWorld());reply["dead"]=victim->IsDead()!=0;}
++            else if(op=="dialogue-exit"){
++                auto actor=pendingNativeActor?pendingNativeActor:player;
++                actor->GetEM()->OnMessage(new oCMsgConversation(oCMsgConversation::EV_STOPPROCESSINFOS),actor);
++            }
 +            else if(op=="finish"){info.Exit();info.OnTermination();}
 +            else if(op=="real-quest"){
 +                if(owner!=Me())throw std::runtime_error("No dialogue lease");auto npc=Resolve("BAU_950_LOBART");if(!npc)throw std::runtime_error("Missing Lobart");parser->SetInstance("SELF",npc);parser->SetInstance("OTHER",player);int action=parser->GetIndex("DIA_LOBART_WORKNOW_OK");if(action<0)throw std::runtime_error("Missing real quest action");parser->CallFunc(action);
@@ -891,7 +982,7 @@ diff --git a/SharedGameplay.h b/SharedGameplay.h
 new file mode 100644
 --- /dev/null
 +++ b/SharedGameplay.h
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,13 @@
 +// SPDX-License-Identifier: AGPL-3.0-or-later
 +namespace GOTHIC_ENGINE { namespace SharedGameplay {
 +    bool Control(const json&);
@@ -903,6 +994,7 @@ new file mode 100644
 +    void QaTick();
 +    bool CanSave();
 +    bool Fault(const char*);
++    bool ProtectDialogueNpc(zCVob*);
 +} }
 diff --git a/Sources.h b/Sources.h
 --- a/Sources.h

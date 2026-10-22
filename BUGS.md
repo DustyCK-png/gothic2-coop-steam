@@ -3,6 +3,11 @@
 Verified assertions are recorded in party-test.json. This package builds on the host-save beta; host-save regressions require native-pair-test.json and native-intro-test.json from this build.
 
 Fixed in source:
+- Dialogue hotfix 0.2.1: the real oCNpc::OnMessage dispatcher inlines PROCESSINFOS. Delaying SetNpc alone orphaned the information manager after the job saw the previous finished flag. Gate the native job before dispatch, retain it until grant, and run initialization only from that job.
+- Clear native tracking when the job is deleted, hold a reference while inspecting it, cancel pending jobs on denial/timeout and clear talk links. Block rapid new starts while a commit awaits acknowledgement.
+- Preserve in-flight requests across unrelated idle state snapshots. Protect pending/active talk NPCs from remote update resets and allow their local dialogue animations.
+- The old direct-SetNpc QA did not prove an actionable dialogue menu. The revised QA checks an active opened choice view, native STOPPROCESSINFOS and another NPC interaction.
+
 - A bounded five-second pending queue handles a client XP claim arriving before lethal damage is applied by the host; dead/KO/zero-HP confirmation is required.
 - VM XP interception shares native rewards and leveling; authenticated source event IDs preserve equal legitimate awards, repeated packets do not award twice.
 - Combat reward identities include world and victim; one reward per victim per saved campaign (revival does not reset the reward).
@@ -20,3 +25,6 @@ Open / not a claim of complete co-op:
 - An interrupted client dialogue is closed locally; arbitrary already-executed script side effects cannot be rolled back.
 
 Upstream: Gothic-Workshop/GothicCoop, AGPL-3.0-or-later. Game files and saves must never be redistributed with the source package.
+
+Open focused boundary: external cancellation of the pending conversation event by combat/cutscene/KillMessages during the handshake still needs its own native regression.
+Artificially spawned combat-bot scenarios can occasionally time out; a passing local run is not a full real-world campaign certification.

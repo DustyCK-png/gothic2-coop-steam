@@ -8,6 +8,12 @@ Adaptations of [GothicCoop v60](https://github.com/Gothic-Workshop/GothicCoop) f
 
 [РџРѕР»РЅР°СЏ РёРЅСЃС‚СЂСѓРєС†РёСЏ РїРѕ-СЂСѓСЃСЃРєРё](INSTALL-RU.md) В· [РЎРѕС…СЂР°РЅРµРЅРёСЏ Сѓ С…РѕСЃС‚Р°](HOST-SAVES-RU.md) В· [Known issues](BUGS.md)
 
+## Guest dialogue hotfix 0.2.1
+
+The 0.2.0 guest could get a dialogue camera without response options. The host permission handshake prematurely completed the native conversation job; the actual NPC dispatcher also inlined that handler. Both paths now retain the job until permission, resume native initialization from it, and clear completed/cancelled jobs safely. Pending/active speakers are protected against remote command resets.
+
+The regression checks an active opened choice view, native STOPPROCESSINFOS and another interaction. Disabling this fix reproduces the missing-options timeout on the same binary; an idle state before grant is also tested. The original direct-function QA missed this bug. Update both peers and restart the session; no hot replacement can recover an already wedged old conversation.
+
 ## Build
 
 Install Visual Studio C++, Windows SDK, Git and CMake. Run `bootstrap.ps1` in PowerShell to fetch the pinned upstream commit and apply `patches/GothicCoop.patch`. Existing vendor trees are never overwritten.

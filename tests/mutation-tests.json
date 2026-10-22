@@ -1,5 +1,6 @@
 {
   "xp": {
+    "dll_sha256": null,
     "detected": true,
     "error": "Native party QA timeout",
     "assertions": {
@@ -7,6 +8,7 @@
     }
   },
   "render": {
+    "dll_sha256": null,
     "detected": true,
     "error": "{'error': 'Puppet failed to respawn', 'id': '1792571661965437600', 'ok': False}",
     "assertions": {
@@ -19,6 +21,7 @@
     }
   },
   "dialogue": {
+    "dll_sha256": null,
     "detected": true,
     "error": "Host started a second dialogue",
     "assertions": {
@@ -32,6 +35,7 @@
     }
   },
   "quest": {
+    "dll_sha256": null,
     "detected": true,
     "error": "Native party QA timeout",
     "assertions": {
@@ -43,6 +47,20 @@
       "native_level_up_and_learning_points": true,
       "distance_respawn_and_gear": true,
       "exclusive_dialogue": true
+    }
+  },
+  "native-dialogue": {
+    "dll_sha256": "90664c8303abb31388363ae6586c85118ab3b4cd6edc76cd609f10e98e1e9e92",
+    "detected": true,
+    "error": "Native party QA timeout",
+    "assertions": {
+      "both_player_models_visible": true,
+      "host_reward_shared_once": true,
+      "duplicate_reward_ignored": true,
+      "client_reward_shared_once": true,
+      "equal_legitimate_rewards_preserved": true,
+      "native_level_up_and_learning_points": true,
+      "distance_respawn_and_gear": true
     }
   }
 }
