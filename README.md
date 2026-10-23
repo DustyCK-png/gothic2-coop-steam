@@ -1,22 +1,42 @@
-# Gothic II Co-op over Steam вЂ” gameplay beta
+# Gothic II Co-op через Steam
 
-Adaptations of [GothicCoop v60](https://github.com/Gothic-Workshop/GothicCoop) for Gothic II Night of the Raven 2.6 fix, Union 1.0m, Windows and Steam AppID 480. Requires a legally installed game on both PCs. Game files and proprietary runtime installations are not included in this repository.
+Экспериментальный кооп для **Gothic II: Ночь Ворона 2.6 fix**, Windows, Union 1.0m. Основан на [GothicCoop v60](https://github.com/Gothic-Workshop/GothicCoop).
 
-**Verified on two real local game clients:** host and client combat rewards shared once, equal legitimate repeated rewards preserved, native level-up and learning points, player puppet distance respawn with equipment, one party-wide NPC dialogue lease, lease expiry closing the old conversation, quest flags/journal/told information replication, a native Lobart quest acceptance, and host-owned profile capture/restore/reconnect. See `tests/party-test.json`, `tests/native-pair-test.json`, `tests/native-intro-test.json`. The positive tests identify the tested DLL by SHA256; mutation checks detect disabled fixes.
+## Игрокам
 
-**Not full shared quest authority:** quest items, NPC creation/routines/attitudes, world triggers and teleport side effects are not fully synchronized. Full campaign, transitions, several friends, old-slot reward rollback and two different real Steam accounts remain unverified. This is an experimental beta.
+**Начните с [пошаговой инструкции на русском](INSTALL-RU.md).** В ней отдельно показано, что делает хост и что делает друг.
 
-[РџРѕР»РЅР°СЏ РёРЅСЃС‚СЂСѓРєС†РёСЏ РїРѕ-СЂСѓСЃСЃРєРё](INSTALL-RU.md) В· [РЎРѕС…СЂР°РЅРµРЅРёСЏ Сѓ С…РѕСЃС‚Р°](HOST-SAVES-RU.md) В· [Known issues](BUGS.md)
+- Для установки нужен единый **Gothic2Coop-Mod.zip**. Настройки имени и пароля уже входят в мод.
+- После установки: хост запускает **Steam-Host-Saves.cmd**, друг — **Steam-Join-Saves.cmd**.
+- Имя и одинаковый пароль задаются в **CoopSettings.ini** в папке игры. [Объяснение настроек](SETTINGS-RU.md) · [Пример файла](CoopSettings.example.ini).
+- Сохраняет хост. Для резервной копии нужны **Saves и CoopHostSaves вместе**.
+- Каждый игрок должен иметь свою установленную игру и собственный Steam-аккаунт.
 
-## Guest dialogue hotfix 0.2.1
+### Какой файл скачивать
 
-The 0.2.0 guest could get a dialogue camera without response options. The host permission handshake prematurely completed the native conversation job; the actual NPC dispatcher also inlined that handler. Both paths now retain the job until permission, resume native initialization from it, and clear completed/cancelled jobs safely. Pending/active speakers are protected against remote command resets.
+Смотрите [файлы релизов](https://github.com/DustyCK-png/gothic2-coop-steam/releases). Инструкция выше относится к **Gothic2Coop-Mod.zip** с единым установщиком и настройками. Если такого файла в релизе нет, получите этот пакет у владельца проекта: его подготовка локально не означает публикацию на GitHub. Старый **Gothic2Coop-GameplayBeta.zip** не является этим полным установщиком и сам по себе не добавляет пароль.
 
-The regression checks an active opened choice view, native STOPPROCESSINFOS and another interaction. Disabling this fix reproduces the missing-options timeout on the same binary; an idle state before grant is also tested. The original direct-function QA missed this bug. Update both peers and restart the session; no hot replacement can recover an already wedged old conversation.
+В этом обновлении документации полный пакет Union не публикуется. Игровые EXE, миры и личные сохранения в репозиторий не входят.
 
-## Build
+## Что умеет сборка
 
-Install Visual Studio C++, Windows SDK, Git and CMake. Run `bootstrap.ps1` in PowerShell to fetch the pinned upstream commit and apply `patches/GothicCoop.patch`. Existing vendor trees are never overwritten.
+Steam-лобби и подключение через друзей; общий опыт для поддерживаемых наград; отображение второго игрока; ограничение одновременных разговоров; частичная передача квестовых флагов и журнала; снимки прогресса друзей у хоста. Соединение использует тестовый Steam AppID 480, поэтому Steam может показывать Spacewar.
+
+**Это ещё не готовое полное совместное прохождение.** Квестовые предметы, NPC, распорядки и все изменения мира синхронизируются не полностью. [Ограничения](BUGS.md) · [Подробно о сохранениях](HOST-SAVES-RU.md).
+
+## Статус проверки — 23 октября 2026
+
+- Прошли: целостность единого архива, установка/удаление/повторная установка, сохранение изменённых настроек и игровых сохранений.
+- Прошли на реальных процессах relay с имитацией Steam: имя, правильный/неправильный/пустой пароль, блокировка обхода, повтор проверки при задержке и потере первых пакетов.
+- После исправления повторного чтения временно недоступного файла прошли передача, проверка целостности и восстановление снимков, сохранение офлайн-друга, блокировка несовпадающего слота и незавершённой записи.
+- Последний повтор полного теста двух игровых клиентов остановился по тайм-ауту запуска хоста. Поэтому свежая проверка диалогов, опыта и квестов **не завершена**. Старые успешные JSON в tests — результаты предыдущих прогонов.
+- Два настоящих Steam-аккаунта, вся кампания и переходы между мирами остаются непроверенными.
+
+Текущая документация описывает локальный единый пакет. Источники и исторические тесты в репозитории могут отставать от него; эта публикация обновляет инструкции, а не объявляет новый бинарный релиз.
+
+## Для разработчиков
+
+Для опубликованного в репозитории исходного состояния установите Visual Studio C++, Windows SDK, Git и CMake. Выполните bootstrap.ps1: он загрузит закреплённый upstream и применит патч; существующий vendor не перезаписывается.
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 18 2026" -A Win32
@@ -25,28 +45,4 @@ cmake -S steam -B steam-build -G "Visual Studio 18 2026" -A Win32
 cmake --build steam-build --config Release
 ```
 
-The plugin is AGPL-3.0-or-later; relay code is MIT-derived. Upstream dependency licenses apply. Do not distribute game binaries, worlds or player snapshots.
-
-## Install / update
-
-For a fresh manual installation, create a separate Latin-path copy, e.g. `C:\Games\Gothic2Coop`, install Union 1.0m from its official distribution, put the compiled plugin in `system/Autorun`, and the upstream GothicCoopConfig.json in `system`. Create `SteamLink` with the compiled G2Steam.exe, a legitimately obtained official **x86** steam_api.dll and steam_appid.txt containing `480`. Never use mock_steam_api.dll for play. Copy `steam/Steam-Host-Saves.cmd` and `steam/Steam-Join-Saves.cmd` to the game root. Install matching builds on both PCs. Keep the source package with redistributed plugin builds.
-
-The GameplayBeta update archive is for an existing HostSaves install: close the game and run Update.cmd. It backs up the old DLL and leaves saves/settings untouched. The complete Gothic2Coop-Steam.zip described in INSTALL-RU.md is the separately prepared local installation bundle; it is not needed when following the manual source installation above.
-
-## Play through Friends в†’ Join Game
-
-1. Start Steam on both PCs with different online accounts added as friends.
-2. Host: Steam-Host-Saves.cmd в†’ load the intended slot/new game в†’ finish the introduction в†’ F1 in the world.
-3. Friend: Steam-Join-Saves.cmd в†’ load the world and finish dialogue в†’ Shift+Tab в†’ Friends в†’ host в†’ Join Game. F2 is not needed for this path. Keep both launchers open.
-4. Only one player can talk to any NPC at a time. A stalled client's dialogue closes when its lease expires.
-5. Only the host saves. Finish dialogues, stop gameplay actions, save through the menu and wait for **Host saves: complete** before quitting. Back up **Saves and CoopHostSaves together**. Next time load the same host slot and join with the same Steam account. Restart the session before loading a different slot.
-
-Shift+Tab opens Steam overlay, F10 opens the lobby invite window, Shift+F10 opens friends. Steam may display Spacewar because AppID 480 is a test integration, not official Gothic II multiplayer. Invites are never sent just by opening the invite window.
-
-Keep Steam overlay enabled. In SystemPack.ini use `[DEBUG] SteamOverlayFix=0` and `OptimizeVB=0`, and keep GameOverlayTakeControl=True. The plugin loads the API from SteamLink; no extra API copy in system is needed. Direct Gothic2.exe launch does not enable launcher integration.
-
-## Testing
-
-`tests/party_qa.py` uses two disposable installations at C:/Games/Gothic2Coop-GameplayQA and C:/Games/Gothic2Coop-TestClient. Each launches its own fresh game and exits its own processes; never point it at valuable saves. Run with an argument `xp`, `render`, `dialogue` or `quest` for a deliberate QA-only fault: that test must fail. The verified DLL hook addresses require the exact supported 2.6 fix executable. Same-PC QA changes verified singleton checks only in suspended test-process memory; no EXE is modified on disk.
-
-`tests/native_pair_qa.py` checks native capture/restore; `tests/native_intro_qa.py` checks a new free-slot checkpoint after Xardas. Relay tests in steam use a mock Steam API. These tests do not replace a real two-account Internet playtest.
+Плагин: AGPL-3.0-or-later. Код relay: производный от MIT-проекта, лицензии зависимостей сохраняются. Не распространяйте игровые EXE, миры или чужие сохранения. Проверки из tests используют отдельные тестовые установки; не направляйте их на ценные сохранения.
